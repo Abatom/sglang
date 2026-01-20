@@ -24,6 +24,23 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 logger = logging.getLogger(__name__)
 
 
+def _extract_url(item):
+    """Extract URL from either a string or an object with .url attribute.
+
+    This helper handles both cases:
+    - String URLs (e.g., from audio_url parsing in jinja_template_utils.py)
+    - Objects with .url attribute (e.g., ImageData from image_url parsing)
+    """
+    if isinstance(item, str):
+        return item
+    elif hasattr(item, "url"):
+        return item.url
+    elif isinstance(item, dict) and "url" in item:
+        return item["url"]
+    else:
+        raise ValueError(f"Cannot extract URL from {type(item)}: {item}")
+
+
 class EmbeddingModality(Enum):
     IMAGE = auto()
     AUDIO = auto()
@@ -557,10 +574,11 @@ class MMReceiver:
 
         # Process image data
         if has_image:
+            # Handle both string URLs and objects with .url attribute
             if type(obj.image_data) != list:
-                image_urls = [obj.image_data.url]
+                image_urls = [_extract_url(obj.image_data)]
             else:
-                image_urls = [img.url for img in obj.image_data]
+                image_urls = [_extract_url(img) for img in obj.image_data]
             if image_urls and len(image_urls) > 0:
                 logger.info(
                     f"Processing {len(image_urls)} images for request {obj.rid}"
@@ -591,10 +609,11 @@ class MMReceiver:
 
         # Process audio data
         elif has_audio:
+            # Handle both string URLs and objects with .url attribute
             if type(obj.audio_data) != list:
-                audio_urls = [obj.audio_data.url]
+                audio_urls = [_extract_url(obj.audio_data)]
             else:
-                audio_urls = [aud.url for aud in obj.audio_data]
+                audio_urls = [_extract_url(aud) for aud in obj.audio_data]
             if audio_urls and len(audio_urls) > 0:
                 logger.info(
                     f"Processing {len(audio_urls)} audios for request {obj.rid}"
@@ -637,10 +656,11 @@ class MMReceiver:
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
 
             # Extract URLs based on modality
+            # Handle both string URLs and objects with .url attribute
             if type(mm_data) != list:
-                mm_urls = [mm_data.url]
+                mm_urls = [_extract_url(mm_data)]
             else:
-                mm_urls = [item.url for item in mm_data]
+                mm_urls = [_extract_url(item) for item in mm_data]
 
             # Determine endpoint based on modality
             encode_endpoint = (
