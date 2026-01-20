@@ -539,9 +539,18 @@ class MMReceiver:
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
         """Send encode request for image or audio data."""
+
+        # Helper to check if data is actually present (not None and not empty)
+        def _has_data(data):
+            if data is None:
+                return False
+            if isinstance(data, (list, tuple)) and len(data) == 0:
+                return False
+            return True
+
         # Determine what type of multimodal data we have
-        has_image = hasattr(obj, "image_data") and obj.image_data is not None
-        has_audio = hasattr(obj, "audio_data") and obj.audio_data is not None
+        has_image = hasattr(obj, "image_data") and _has_data(obj.image_data)
+        has_audio = hasattr(obj, "audio_data") and _has_data(obj.audio_data)
 
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex

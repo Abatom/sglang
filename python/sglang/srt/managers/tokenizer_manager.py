@@ -715,15 +715,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         EmbeddingModality,
                     )
 
+                    # Helper to check if data is actually present (not None and not empty)
+                    def _has_data(data):
+                        if data is None:
+                            return False
+                        if isinstance(data, (list, tuple)) and len(data) == 0:
+                            return False
+                        return True
+
                     # Determine modality and receive mm_data accordingly
-                    if obj.image_data is not None:
+                    if _has_data(obj.image_data):
                         mm_inputs = await self.mm_receiver.recv_mm_data(
                             mm_data=obj.image_data,
                             mm_processor=self.mm_processor,
                             prompt=(input_text or input_ids),
                             modality=EmbeddingModality.IMAGE,
                         )
-                    elif obj.audio_data is not None:
+                    elif _has_data(obj.audio_data):
                         mm_inputs = await self.mm_receiver.recv_mm_data(
                             mm_data=obj.audio_data,
                             mm_processor=self.mm_processor,
