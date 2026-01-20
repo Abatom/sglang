@@ -71,7 +71,7 @@ class PendingRequest:
         self.submit_time = time.time()
 
 
-class BatchScheduler:
+class EncoderScheduler:
     """
     Scheduler that batches incoming encode requests for efficient GPU utilization.
     Requests are queued and processed together when either:
@@ -79,7 +79,15 @@ class BatchScheduler:
     2. The batch timeout expires
     """
 
-    def __init__(self, max_batch_size: int, batch_timeout_ms: float):
+    def __init__(
+        self,
+        encoder: "MMEncoder",
+        send_sockets: List[zmq.Socket],
+        max_batch_size: int,
+        batch_timeout_ms: float,
+    ):
+        self.encoder = encoder
+        self.send_sockets = send_sockets
         self.max_batch_size = max_batch_size
         self.batch_timeout = batch_timeout_ms / 1000.0  # Convert to seconds
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
@@ -92,7 +100,7 @@ class BatchScheduler:
         if self._batch_worker_task is None:
             self._batch_worker_task = asyncio.create_task(self._batch_worker())
             logger.info(
-                f"BatchScheduler started with max_batch_size={self.max_batch_size}, "
+                f"EncoderScheduler started with max_batch_size={self.max_batch_size}, "
                 f"batch_timeout_ms={self.batch_timeout * 1000}"
             )
 
@@ -158,25 +166,6 @@ class BatchScheduler:
                 for pending in batch:
                     if not pending.future.done():
                         pending.future.set_exception(e)
-
-    async def _process_batch(self, batch: List[PendingRequest]):
-        """Process a batch of requests. To be overridden by subclass."""
-        raise NotImplementedError
-
-
-class EncoderBatchScheduler(BatchScheduler):
-    """BatchScheduler specialized for encoding requests."""
-
-    def __init__(
-        self,
-        encoder: "MMEncoder",
-        send_sockets: List[zmq.Socket],
-        max_batch_size: int,
-        batch_timeout_ms: float,
-    ):
-        super().__init__(max_batch_size, batch_timeout_ms)
-        self.encoder = encoder
-        self.send_sockets = send_sockets
 
     async def _process_batch(self, batch: List[PendingRequest]):
         """Process a batch of encoding requests."""
@@ -885,7 +874,7 @@ class EncoderProfiler:
 app = FastAPI()
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
-batch_scheduler: Optional[EncoderBatchScheduler] = None
+batch_scheduler: Optional[EncoderScheduler] = None
 
 
 async def run_encoder(
@@ -946,7 +935,7 @@ def launch_server(server_args: ServerArgs):
 
     # Initialize batch scheduler if batch size > 1
     if ENCODER_MAX_BATCH_SIZE > 1:
-        batch_scheduler = EncoderBatchScheduler(
+        batch_scheduler = EncoderScheduler(
             encoder=encoder,
             send_sockets=send_sockets,
             max_batch_size=ENCODER_MAX_BATCH_SIZE,
