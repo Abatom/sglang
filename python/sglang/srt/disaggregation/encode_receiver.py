@@ -4,6 +4,7 @@ import pickle
 import random
 import threading
 import uuid
+from enum import Enum, auto
 from typing import List, Optional
 
 import aiohttp
@@ -23,8 +24,22 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 logger = logging.getLogger(__name__)
 
 
+class EmbeddingModality(Enum):
+    IMAGE = auto()
+    AUDIO = auto()
+
+
 class EmbeddingData:
-    def __init__(self, req_id, num_parts, part_idx, image_grid_dim, embedding=None):
+    def __init__(
+        self,
+        req_id,
+        num_parts,
+        part_idx,
+        image_grid_dim=None,
+        embedding=None,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
+        audio_feature_lens=None,
+    ):
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
@@ -33,6 +48,8 @@ class EmbeddingData:
         self.send_time = None
         self.dtype = embedding.dtype if embedding is not None else None
         self.shape = list(embedding.shape) if embedding is not None else None
+        self.modality = modality
+        self.audio_feature_lens = audio_feature_lens
         # aggregated data
         self.ready_list = [i == self.part_idx for i in range(self.num_parts)]
         self.embedding_list = [
@@ -42,6 +59,10 @@ class EmbeddingData:
             self.image_grid_dim if i == self.part_idx else None
             for i in range(self.num_parts)
         ]
+        self.audio_feature_lens_list = [
+            self.audio_feature_lens if i == self.part_idx else None
+            for i in range(self.num_parts)
+        ]
 
     def add(self, embedding_data):
         assert self.req_id == embedding_data.req_id
@@ -49,6 +70,9 @@ class EmbeddingData:
         self.ready_list[embedding_data.part_idx] = True
         self.image_grid_dim_list[embedding_data.part_idx] = (
             embedding_data.image_grid_dim
+        )
+        self.audio_feature_lens_list[embedding_data.part_idx] = (
+            embedding_data.audio_feature_lens
         )
         self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
 
@@ -61,12 +85,21 @@ class EmbeddingData:
     def get_img_grid(self):
         return torch.concatenate(self.image_grid_dim_list)
 
+    def get_audio_feature_lens(self):
+        return torch.concatenate(self.audio_feature_lens_list)
+
+    def is_audio(self):
+        return self.modality == EmbeddingModality.AUDIO
+
+    def is_image(self):
+        return self.modality == EmbeddingModality.IMAGE
+
     @property
     def ready(self):
         return sum(self.ready_list) == self.num_parts
 
     def __repr__(self):
-        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx})"
+        return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
 
     def copy_without_embedding(self):
         new_data = EmbeddingData(
@@ -74,6 +107,8 @@ class EmbeddingData:
             num_parts=self.num_parts,
             part_idx=self.part_idx,
             image_grid_dim=self.image_grid_dim,
+            modality=self.modality,
+            audio_feature_lens=self.audio_feature_lens,
         )
         new_data.send_time = self.send_time
         new_data.dtype = self.dtype
@@ -82,7 +117,9 @@ class EmbeddingData:
 
 
 # For zmq_to_scheduler
-class WaitingImageRequest:
+class WaitingMMRequest:
+    """Waiting request for multimodal data (image or audio)."""
+
     def __init__(
         self,
         rid: str,
@@ -91,6 +128,7 @@ class WaitingImageRequest:
         encoder_urls,
         host_name,
         receive_count,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -102,10 +140,11 @@ class WaitingImageRequest:
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
+        self.modality = modality
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
             zmq.Context(), zmq.PULL
         )
-        logger.info(f"Waiting for input {self.embedding_port = }")
+        logger.info(f"Waiting for input {self.embedding_port = } modality={modality}")
         self.recv_embedding_data = None
         self.ready = False
 
@@ -184,15 +223,28 @@ class WaitingImageRequest:
                 self.recv_embedding_data.add(recv_obj)
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        img_grid_thw = self.recv_embedding_data.get_img_grid()
 
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text, recv_embedding, img_grid_thw
-        )
+        # Handle different modalities
+        if self.recv_embedding_data.is_audio():
+            audio_feature_lens = self.recv_embedding_data.get_audio_feature_lens()
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text, recv_embedding, audio_feature_lens
+            )
+        else:
+            # Image modality
+            img_grid_thw = self.recv_embedding_data.get_img_grid()
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text, recv_embedding, img_grid_thw
+            )
+
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
         self.ready = True
         self.recv_socket.close()
+
+
+# Backward compatibility alias
+WaitingImageRequest = WaitingMMRequest
 
 
 def _determine_tensor_transport_mode(server_args):
@@ -274,15 +326,39 @@ class MMReceiver:
         for recv_req in recv_reqs:
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
-                and recv_req.need_wait_for_image is True
+                and getattr(recv_req, "need_wait_for_mm", False) is True
             ):
-                waiting_req = WaitingImageRequest(
+                # Determine modality based on the mm_modality field
+                modality_str = getattr(recv_req, "mm_modality", "IMAGE")
+                if modality_str == "AUDIO":
+                    modality = EmbeddingModality.AUDIO
+                else:
+                    modality = EmbeddingModality.IMAGE
+
+                waiting_req = WaitingMMRequest(
                     rid=recv_req.rid,
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    modality=modality,
+                )
+                waiting_req.send_encode_request()
+                self.waiting_list.append(waiting_req)
+            # Backward compatibility: handle need_wait_for_image
+            elif (
+                isinstance(recv_req, TokenizedGenerateReqInput)
+                and getattr(recv_req, "need_wait_for_image", False) is True
+            ):
+                waiting_req = WaitingMMRequest(
+                    rid=recv_req.rid,
+                    recv_req=recv_req,
+                    mm_processor=self.mm_processor,
+                    encoder_urls=self.encode_urls,
+                    host_name=self.hostname,
+                    receive_count=self.tp_size,
+                    modality=EmbeddingModality.IMAGE,
                 )
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
@@ -317,17 +393,24 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+        self,
+        req_id,
+        mm_data,
+        endpoint_encode,
+        num_items_assigned,
+        embedding_port,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
     ):
         try:
             asyncio.run(
                 self.encode(
                     req_id=req_id,
-                    img_data=img_data,
+                    mm_data=mm_data,
                     embedding_port=embedding_port,
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
                     num_items_assigned=num_items_assigned,
+                    modality=modality,
                 )
             )
         except Exception as e:
@@ -336,13 +419,14 @@ class MMReceiver:
     async def encode(
         self,
         req_id,
-        img_data,
+        mm_data,
         embedding_port,
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
     ):
-        if len(img_data) == 0:
+        if len(mm_data) == 0:
             return
 
         # Split mm_items
@@ -350,7 +434,7 @@ class MMReceiver:
         if num_items_assigned is None:
             random.shuffle(self.encode_idx)
             num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls)
+                (idx + len(mm_data)) // len(self.encode_urls)
                 for idx in self.encode_idx
             ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
@@ -362,12 +446,13 @@ class MMReceiver:
             encode_requests.append(
                 {
                     "encoder_idx": idx,
-                    "mm_items": img_data[cum_num_items : cum_num_items + assigned_num],
+                    "mm_items": mm_data[cum_num_items : cum_num_items + assigned_num],
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
                     "req_id": req_id,
                     "prefill_host": self.host,
                     "embedding_port": embedding_port,
+                    "modality": modality.name,  # Include modality info
                 }
             )
             cum_idx += 1
@@ -379,10 +464,15 @@ class MMReceiver:
             )  # Add timeout for request reliability
         ) as session:
             # Send encode requests
-
+            # Use different endpoint for audio vs image
+            encode_endpoint = (
+                "encode_audio"
+                if modality == EmbeddingModality.AUDIO
+                else endpoint_encode
+            )
             tasks = [
                 session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
+                    f"{self.encode_urls[encode_request['encoder_idx']]}/{encode_endpoint}",
                     json=encode_request,
                 )
                 for encode_request in encode_requests
@@ -448,50 +538,120 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        if type(obj.image_data) != list:
-            image_urls = [obj.image_data.url]
-        else:
-            image_urls = [img.url for img in obj.image_data]
+        """Send encode request for image or audio data."""
+        # Determine what type of multimodal data we have
+        has_image = hasattr(obj, "image_data") and obj.image_data is not None
+        has_audio = hasattr(obj, "audio_data") and obj.audio_data is not None
+
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if image_urls and len(image_urls) > 0:
-            logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
 
-            encode_idx = list(range(len(self.encode_urls)))
-            random.shuffle(encode_idx)
-            obj.num_items_assigned = [
-                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
-            ]
-            encode_thread = threading.Thread(
-                target=self._run_encode_in_thread,
-                args=(
-                    obj.rid,
-                    image_urls,
-                    "encode",
-                    obj.num_items_assigned,
-                    None,
-                ),
-                daemon=True,
-            )
-            encode_thread.start()
+        # Process image data
+        if has_image:
+            if type(obj.image_data) != list:
+                image_urls = [obj.image_data.url]
+            else:
+                image_urls = [img.url for img in obj.image_data]
+            if image_urls and len(image_urls) > 0:
+                logger.info(
+                    f"Processing {len(image_urls)} images for request {obj.rid}"
+                )
+                obj.need_wait_for_mm = True
+                obj.need_wait_for_image = True  # Backward compatibility
+                obj.mm_modality = "IMAGE"
+
+                encode_idx = list(range(len(self.encode_urls)))
+                random.shuffle(encode_idx)
+                obj.num_items_assigned = [
+                    (idx + len(image_urls)) // len(self.encode_urls)
+                    for idx in encode_idx
+                ]
+                encode_thread = threading.Thread(
+                    target=self._run_encode_in_thread,
+                    args=(
+                        obj.rid,
+                        image_urls,
+                        "encode",
+                        obj.num_items_assigned,
+                        None,
+                        EmbeddingModality.IMAGE,
+                    ),
+                    daemon=True,
+                )
+                encode_thread.start()
+
+        # Process audio data
+        elif has_audio:
+            if type(obj.audio_data) != list:
+                audio_urls = [obj.audio_data.url]
+            else:
+                audio_urls = [aud.url for aud in obj.audio_data]
+            if audio_urls and len(audio_urls) > 0:
+                logger.info(
+                    f"Processing {len(audio_urls)} audios for request {obj.rid}"
+                )
+                obj.need_wait_for_mm = True
+                obj.mm_modality = "AUDIO"
+
+                encode_idx = list(range(len(self.encode_urls)))
+                random.shuffle(encode_idx)
+                obj.num_items_assigned = [
+                    (idx + len(audio_urls)) // len(self.encode_urls)
+                    for idx in encode_idx
+                ]
+                encode_thread = threading.Thread(
+                    target=self._run_encode_in_thread,
+                    args=(
+                        obj.rid,
+                        audio_urls,
+                        "encode_audio",
+                        obj.num_items_assigned,
+                        None,
+                        EmbeddingModality.AUDIO,
+                    ),
+                    daemon=True,
+                )
+                encode_thread.start()
 
     # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
+    async def recv_mm_data(
+        self,
+        mm_data,
+        mm_processor,
+        prompt,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
+    ):
         try:
             if len(self.encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if type(img_data) != list:
-                img_data = [img_data.url]
+
+            # Extract URLs based on modality
+            if type(mm_data) != list:
+                mm_urls = [mm_data.url]
             else:
-                img_data = [img.url for img in img_data]
+                mm_urls = [item.url for item in mm_data]
+
+            # Determine endpoint based on modality
+            encode_endpoint = (
+                "encode_audio" if modality == EmbeddingModality.AUDIO else "encode"
+            )
+
             asyncio.create_task(
-                self.encode(req_id, img_data, embedding_port, "encode", "send")
+                self.encode(
+                    req_id,
+                    mm_urls,
+                    embedding_port,
+                    encode_endpoint,
+                    "send",
+                    modality=modality,
+                )
             )
             return await asyncio.wait_for(
-                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
+                self._recv_mm_data(
+                    req_id, recv_socket, mm_processor, prompt, modality=modality
+                ),
                 timeout=20,
             )
         except asyncio.TimeoutError:
@@ -501,7 +661,14 @@ class MMReceiver:
             return None
 
     # For zmq_to_tokenizer and mooncake
-    async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
+    async def _recv_mm_data(
+        self,
+        req_id,
+        recv_socket,
+        mm_processor,
+        prompt,
+        modality: EmbeddingModality = EmbeddingModality.IMAGE,
+    ):
         # Bypass MMReceiver
         if req_id is None:
             return None
@@ -535,7 +702,12 @@ class MMReceiver:
 
         recv_socket.close()
 
-        img_grid_thw = recv_embedding_data.get_img_grid()
+        # Handle different modalities
+        if recv_embedding_data.is_audio():
+            audio_feature_lens = recv_embedding_data.get_audio_feature_lens()
+            mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, audio_feature_lens)
+        else:
+            img_grid_thw = recv_embedding_data.get_img_grid()
+            mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
 
-        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
         return mm_inputs

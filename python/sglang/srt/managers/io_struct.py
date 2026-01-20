@@ -263,6 +263,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # For EPD-disaggregated inference
     need_wait_for_image: Optional[bool] = None
+    need_wait_for_mm: Optional[bool] = None
+    mm_modality: Optional[str] = None  # "IMAGE" or "AUDIO"
     num_items_assigned: Optional[List] = None
 
     # Multimodal tiling controls (extensions)
@@ -759,6 +761,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_entropy: bool = False
 
     need_wait_for_image: bool = False
+    need_wait_for_mm: bool = False
+    mm_modality: Optional[str] = None  # "IMAGE" or "AUDIO"
     num_items_assigned: Optional[List] = None
 
 

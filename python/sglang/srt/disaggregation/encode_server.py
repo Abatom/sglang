@@ -22,7 +22,7 @@ from transformers import AutoImageProcessor
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encode_receiver import EmbeddingData
+from sglang.srt.disaggregation.encode_receiver import EmbeddingData, EmbeddingModality
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
@@ -339,6 +339,131 @@ class MMEncoder:
 
         return _get_image_grid_dim(images_input), mm_embedding
 
+    async def _flatten_and_load_audios(self, mm_items):
+        """
+        Flatten mm_items structure, load audios concurrently, and restore original structure.
+
+        Returns:
+            Same structure as load_audios would return
+        """
+        # Handle single audio (not a list)
+        if not isinstance(mm_items, (list, tuple)):
+            futures, _ = self.submit_data_loading_tasks([mm_items], [Modality.AUDIO])
+            return [await asyncio.wrap_future(futures[0])]
+
+        # Handle simple list
+        futures, _ = self.submit_data_loading_tasks(
+            mm_items, [Modality.AUDIO] * len(mm_items)
+        )
+        # Wait for all tasks to complete asynchronously
+        async_futures = [asyncio.wrap_future(f) for f in futures]
+        return await asyncio.gather(*async_futures)
+
+    async def _encode_audio(self, mm_items) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode audio items using the audio encoder.
+
+        Args:
+            mm_items: List of audio URLs or audio data
+
+        Returns:
+            Tuple of (audio_feature_lens, audio_embeddings)
+        """
+        from transformers import AutoProcessor
+
+        audios = await self._flatten_and_load_audios(mm_items)
+
+        # Use the processor to get audio features
+        processor = AutoProcessor.from_pretrained(
+            self.server_args.model_path,
+            trust_remote_code=self.server_args.trust_remote_code,
+        )
+
+        # Process all audios
+        audio_inputs = processor(
+            audios=audios,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        # Get feature and feature_attention_mask
+        feature = audio_inputs.get("input_features")
+        if feature is None:
+            raise ValueError("No input_features found in audio processor output")
+
+        feature_attention_mask = audio_inputs.get("feature_attention_mask")
+
+        mm_item = MultimodalDataItem.from_dict(
+            {
+                "modality": Modality.AUDIO,
+                "feature": _convert(feature),
+            }
+        )
+        if feature_attention_mask is not None:
+            mm_item.set("feature_attention_mask", _convert(feature_attention_mask))
+
+        # Compute audio feature lens
+        if feature_attention_mask is not None:
+            input_lengths = feature_attention_mask.sum(dim=-1)
+            input_lengths = (input_lengths - 1) // 2 + 1
+            output_lengths = (input_lengths - 2) // 2 + 1
+            mm_item.set("audio_feature_lens", output_lengths)
+        else:
+            # Fallback: estimate lengths from feature shape
+            output_lengths = torch.tensor([feature.shape[-1]])
+            mm_item.set("audio_feature_lens", output_lengths)
+
+        # support mm_cache
+        mm_embedding = None
+        mm_hash = None
+
+        start_time = time.perf_counter()
+        if self.server_args.enable_prefix_mm_cache:
+            mm_item.set_pad_value()
+            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+            async with self.mm_cache_lock:
+                mm_cache = self.mm_cache.get([mm_item.hash])
+                if mm_cache is not None:
+                    mm_embedding = mm_cache.embedding
+
+        if mm_embedding is None:
+            with torch.inference_mode():
+                mm_embedding: torch.Tensor = self.model.get_audio_feature([mm_item])
+                mm_embedding = mm_embedding.cpu()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+
+        if self.server_args.enable_prefix_mm_cache:
+            async with self.mm_cache_lock:
+                self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
+        end_time = time.perf_counter()
+        logger.info(
+            f"Audio encoder time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+        )
+        if self.profiler is not None:
+            self.profiler.step()
+
+        return mm_item.audio_feature_lens, mm_embedding
+
+    async def encode_audio(self, mm_items, req_id, num_parts, part_idx):
+        """Encode audio items and prepare embedding data for sending."""
+        start_time = time.time()
+        audio_feature_lens, mm_embedding = await self._encode_audio(mm_items)
+        end_time = time.time()
+        logger.info(f"🎵 audio encode cost = {(end_time - start_time) * 1000:.2f}ms")
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id=req_id,
+                num_parts=num_parts,
+                part_idx=part_idx,
+                image_grid_dim=None,
+                embedding=mm_embedding,
+                modality=EmbeddingModality.AUDIO,
+                audio_feature_lens=audio_feature_lens,
+            )
+            self.embedding_to_send[mm_data.req_id] = mm_data
+        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+
     async def _send(
         self,
         embedding: torch.Tensor,
@@ -581,12 +706,22 @@ async def run_encoder(
             else:
                 encoder.profiler.stop()
         else:
-            await encoder.encode(
-                mm_items=request["mm_items"],
-                req_id=request["req_id"],
-                num_parts=request["num_parts"],
-                part_idx=request["part_idx"],
-            )
+            # Check if this is an audio encoding request
+            modality = request.get("modality", "image")
+            if modality == "audio":
+                await encoder.encode_audio(
+                    mm_items=request["mm_items"],
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                )
+            else:
+                await encoder.encode(
+                    mm_items=request["mm_items"],
+                    req_id=request["req_id"],
+                    num_parts=request["num_parts"],
+                    part_idx=request["part_idx"],
+                )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -630,6 +765,60 @@ async def handle_encode_request(request: dict):
         socket.send_pyobj(request)
 
     nbytes, embedding_len, embedding_dim = await encoder.encode(
+        mm_items=request["mm_items"],
+        req_id=request["req_id"],
+        num_parts=request["num_parts"],
+        part_idx=request["part_idx"],
+    )
+    if encoder.server_args.encoder_transfer_backend == "mooncake":
+        del request["mm_items"]
+        request.update(
+            {
+                "embedding_size": nbytes,
+                "embedding_len": embedding_len,
+                "embedding_dim": embedding_dim,
+            }
+        )
+        return ORJSONResponse(content=request)
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+        logger.info(f"{request['embedding_port'] = }")
+        if request["embedding_port"] is None:
+            await encoder.send_with_url(
+                req_id=request["req_id"],
+            )
+        else:
+            assert type(request["embedding_port"]) == list
+            tasks = []
+            for embedding_port in request["embedding_port"]:
+                tasks.append(
+                    encoder.send(
+                        req_id=request["req_id"],
+                        prefill_host=request["prefill_host"],
+                        embedding_port=embedding_port,
+                    )
+                )
+            await asyncio.gather(*tasks)
+            encoder.embedding_to_send.pop(request["req_id"], None)
+        return ORJSONResponse(content=None)
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+        await encoder.send(
+            req_id=request["req_id"],
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
+        )
+        encoder.embedding_to_send.pop(request["req_id"], None)
+        return ORJSONResponse(content=None)
+
+
+@app.post("/encode_audio")
+async def handle_encode_audio_request(request: dict):
+    """Handle audio encoding requests."""
+    # broadcast request
+    request.update({"enter_time": time.time(), "modality": "audio"})
+    for socket in send_sockets:
+        socket.send_pyobj(request)
+
+    nbytes, embedding_len, embedding_dim = await encoder.encode_audio(
         mm_items=request["mm_items"],
         req_id=request["req_id"],
         num_parts=request["num_parts"],

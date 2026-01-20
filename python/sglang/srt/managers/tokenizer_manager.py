@@ -710,11 +710,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
                 if self.server_args.language_only:
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        img_data=obj.image_data,
-                        mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
+                    # Import EmbeddingModality for modality detection
+                    from sglang.srt.disaggregation.encode_receiver import (
+                        EmbeddingModality,
                     )
+
+                    # Determine modality and receive mm_data accordingly
+                    if obj.image_data is not None:
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            mm_data=obj.image_data,
+                            mm_processor=self.mm_processor,
+                            prompt=(input_text or input_ids),
+                            modality=EmbeddingModality.IMAGE,
+                        )
+                    elif obj.audio_data is not None:
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            mm_data=obj.audio_data,
+                            mm_processor=self.mm_processor,
+                            prompt=(input_text or input_ids),
+                            modality=EmbeddingModality.AUDIO,
+                        )
                 if mm_inputs is None:
                     mm_inputs: Dict = await self.mm_data_processor.process(
                         image_data=obj.image_data,
