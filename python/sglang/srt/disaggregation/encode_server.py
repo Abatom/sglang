@@ -57,6 +57,164 @@ use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
 
+# Batch configuration from environment variables
+ENCODER_MAX_BATCH_SIZE = int(os.getenv("SGLANG_ENCODER_MAX_BATCH_SIZE", "8"))
+ENCODER_BATCH_TIMEOUT_MS = float(os.getenv("SGLANG_ENCODER_BATCH_TIMEOUT_MS", "10"))
+
+
+class PendingRequest:
+    """Represents a pending encode request waiting for batch processing."""
+
+    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
+        self.request = request
+        self.future: asyncio.Future = loop.create_future()
+        self.submit_time = time.time()
+
+
+class BatchScheduler:
+    """
+    Scheduler that batches incoming encode requests for efficient GPU utilization.
+    Requests are queued and processed together when either:
+    1. The batch reaches max_batch_size
+    2. The batch timeout expires
+    """
+
+    def __init__(self, max_batch_size: int, batch_timeout_ms: float):
+        self.max_batch_size = max_batch_size
+        self.batch_timeout = batch_timeout_ms / 1000.0  # Convert to seconds
+        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
+        self.is_processing = False
+        self._batch_worker_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+
+    def start(self):
+        """Start the background batch processing worker."""
+        if self._batch_worker_task is None:
+            self._batch_worker_task = asyncio.create_task(self._batch_worker())
+            logger.info(
+                f"BatchScheduler started with max_batch_size={self.max_batch_size}, "
+                f"batch_timeout_ms={self.batch_timeout * 1000}"
+            )
+
+    async def submit(self, request: dict) -> asyncio.Future:
+        """
+        Submit a request for batch processing.
+        Returns a future that will be resolved with the encoding result.
+        """
+        loop = asyncio.get_running_loop()
+        pending = PendingRequest(request, loop)
+        await self.pending_queue.put(pending)
+        return pending.future
+
+    async def _collect_batch(self) -> List[PendingRequest]:
+        """Collect a batch of requests from the queue."""
+        batch = []
+
+        # Wait for at least one request
+        try:
+            first_request = await asyncio.wait_for(
+                self.pending_queue.get(), timeout=1.0
+            )
+            batch.append(first_request)
+        except asyncio.TimeoutError:
+            return batch
+
+        # Try to collect more requests up to max_batch_size or timeout
+        deadline = time.time() + self.batch_timeout
+        while len(batch) < self.max_batch_size:
+            remaining_time = deadline - time.time()
+            if remaining_time <= 0:
+                break
+            try:
+                request = await asyncio.wait_for(
+                    self.pending_queue.get(), timeout=remaining_time
+                )
+                batch.append(request)
+            except asyncio.TimeoutError:
+                break
+
+        return batch
+
+    async def _batch_worker(self):
+        """Background worker that processes batches of requests."""
+        while True:
+            try:
+                batch = await self._collect_batch()
+                if not batch:
+                    continue
+
+                logger.info(f"Processing batch of {len(batch)} requests")
+
+                async with self._lock:
+                    self.is_processing = True
+                    try:
+                        await self._process_batch(batch)
+                    finally:
+                        self.is_processing = False
+
+            except Exception as e:
+                logger.error(f"Error in batch worker: {e}", exc_info=True)
+                # Set error on all pending futures
+                for pending in batch:
+                    if not pending.future.done():
+                        pending.future.set_exception(e)
+
+    async def _process_batch(self, batch: List[PendingRequest]):
+        """Process a batch of requests. To be overridden by subclass."""
+        raise NotImplementedError
+
+
+class EncoderBatchScheduler(BatchScheduler):
+    """BatchScheduler specialized for encoding requests."""
+
+    def __init__(
+        self,
+        encoder: "MMEncoder",
+        send_sockets: List[zmq.Socket],
+        max_batch_size: int,
+        batch_timeout_ms: float,
+    ):
+        super().__init__(max_batch_size, batch_timeout_ms)
+        self.encoder = encoder
+        self.send_sockets = send_sockets
+
+    async def _process_batch(self, batch: List[PendingRequest]):
+        """Process a batch of encoding requests."""
+        start_time = time.time()
+
+        # Prepare batch requests
+        batch_requests = [p.request for p in batch]
+
+        # Broadcast batch request to worker processes
+        batch_msg = {
+            "type": "batch_encode",
+            "requests": batch_requests,
+            "enter_time": start_time,
+        }
+        for socket in self.send_sockets:
+            socket.send_pyobj(batch_msg)
+
+        # Batch encode all requests together
+        try:
+            results = await self.encoder.batch_encode(batch_requests)
+
+            end_time = time.time()
+            logger.info(
+                f"Batch encoding completed: {len(batch)} requests in "
+                f"{(end_time - start_time) * 1000:.2f}ms"
+            )
+
+            # Set results on futures
+            for i, pending in enumerate(batch):
+                if not pending.future.done():
+                    pending.future.set_result(results[i])
+
+        except Exception as e:
+            logger.error(f"Batch encoding failed: {e}", exc_info=True)
+            for pending in batch:
+                if not pending.future.done():
+                    pending.future.set_exception(e)
+
 
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
@@ -727,6 +885,7 @@ class EncoderProfiler:
 app = FastAPI()
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
+batch_scheduler: Optional[EncoderBatchScheduler] = None
 
 
 async def run_encoder(
@@ -764,7 +923,7 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 
 def launch_server(server_args: ServerArgs):
-    global encoder
+    global encoder, batch_scheduler
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
@@ -784,22 +943,57 @@ def launch_server(server_args: ServerArgs):
             daemon=True,
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+
+    # Initialize batch scheduler if batch size > 1
+    if ENCODER_MAX_BATCH_SIZE > 1:
+        batch_scheduler = EncoderBatchScheduler(
+            encoder=encoder,
+            send_sockets=send_sockets,
+            max_batch_size=ENCODER_MAX_BATCH_SIZE,
+            batch_timeout_ms=ENCODER_BATCH_TIMEOUT_MS,
+        )
+        logger.info(
+            f"Batch encoding enabled: max_batch_size={ENCODER_MAX_BATCH_SIZE}, "
+            f"timeout_ms={ENCODER_BATCH_TIMEOUT_MS}"
+        )
+
     uvicorn.run(app, host=server_args.host, port=server_args.port)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start the batch scheduler worker when the server starts."""
+    global batch_scheduler
+    if batch_scheduler is not None:
+        batch_scheduler.start()
 
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
-    # broadcast request
     request.update({"enter_time": time.time()})
-    for socket in send_sockets:
-        socket.send_pyobj(request)
 
-    nbytes, embedding_len, embedding_dim = await encoder.encode(
-        mm_items=request["mm_items"],
-        req_id=request["req_id"],
-        num_parts=request["num_parts"],
-        part_idx=request["part_idx"],
-    )
+    # Use batch scheduler if enabled
+    if batch_scheduler is not None:
+        # Submit request to batch queue and wait for result
+        future = await batch_scheduler.submit(request)
+        try:
+            nbytes, embedding_len, embedding_dim = await future
+        except Exception as e:
+            logger.error(f"Batch encoding failed for request {request.get('req_id')}: {e}")
+            raise
+    else:
+        # Original non-batched path: broadcast and encode immediately
+        for socket in send_sockets:
+            socket.send_pyobj(request)
+
+        nbytes, embedding_len, embedding_dim = await encoder.encode(
+            mm_items=request["mm_items"],
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+        )
+
+    # Handle response based on transfer backend
     if encoder.server_args.encoder_transfer_backend == "mooncake":
         del request["mm_items"]
         request.update(
