@@ -339,6 +339,168 @@ class MMEncoder:
 
         return _get_image_grid_dim(images_input), mm_embedding
 
+    async def _batch_encode(
+        self, batch_mm_items: List[list]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Batch encode multiple requests together for better GPU utilization.
+
+        Args:
+            batch_mm_items: List of mm_items for each request in the batch
+
+        Returns:
+            List of (image_grid_dim, mm_embedding) tuples, one for each request
+        """
+        if len(batch_mm_items) == 0:
+            return []
+
+        # Load all images concurrently and track per-request image counts
+        all_images = []
+        request_image_counts = []
+        for mm_items in batch_mm_items:
+            images = await self._flatten_and_load_images(mm_items)
+            if isinstance(images, list):
+                all_images.extend(images)
+                request_image_counts.append(len(images))
+            else:
+                all_images.append(images)
+                request_image_counts.append(1)
+
+        # Process all images together through image processor
+        kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
+        images_input = self.image_processor(images=all_images, **kwargs)
+        feature = images_input["pixel_values"]
+
+        # Create a single MultimodalDataItem for all images
+        mm_item = MultimodalDataItem.from_dict(
+            {
+                "modality": Modality.IMAGE,
+                "feature": _convert(feature),
+            }
+        )
+        for k, v in images_input.items():
+            if k == "pixel_values":
+                continue
+            mm_item.set(k, _convert(v))
+
+        start_time = time.perf_counter()
+
+        # Get embeddings for all images in one forward pass
+        with torch.inference_mode():
+            mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+            mm_embedding = mm_embedding.cpu()
+        if len(mm_embedding.shape) != 2:
+            mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+
+        end_time = time.perf_counter()
+        logger.info(
+            f"Batch Vit time : {(end_time - start_time)*1000:.2f} ms for {len(batch_mm_items)} requests, {mm_embedding.shape = }"
+        )
+
+        if self.profiler is not None:
+            self.profiler.step()
+
+        # Get the image grid dimensions
+        image_grid_dim = _get_image_grid_dim(images_input)
+
+        # Split embeddings and grid dims back to individual requests
+        results = []
+        embedding_offset = 0
+        grid_offset = 0
+
+        # Calculate the merge factor once (ratio of grid tokens to embedding tokens)
+        # This is model-specific (e.g., 4 for 2x2 spatial merge in Qwen2-VL)
+        if isinstance(image_grid_dim, torch.Tensor) and image_grid_dim.dim() == 2:
+            total_grid_tokens = image_grid_dim.prod(dim=1).sum().item()
+            total_embedding_tokens = mm_embedding.shape[0]
+            merge_factor = max(1, total_grid_tokens // total_embedding_tokens) if total_embedding_tokens > 0 else 1
+        else:
+            merge_factor = 1
+
+        for i, image_count in enumerate(request_image_counts):
+            if isinstance(image_grid_dim, torch.Tensor) and image_grid_dim.dim() == 2:
+                # image_grid_thw format: [num_images, 3] where dims are (t, h, w)
+                request_grid = image_grid_dim[grid_offset : grid_offset + image_count]
+
+                # Calculate total tokens for this request's images
+                request_grid_tokens = request_grid.prod(dim=1).sum().item()
+                num_tokens = request_grid_tokens // merge_factor
+
+                request_embedding = mm_embedding[
+                    embedding_offset : embedding_offset + num_tokens
+                ]
+                results.append((request_grid, request_embedding))
+
+                embedding_offset += num_tokens
+                grid_offset += image_count
+            else:
+                # For models without explicit grid dimensions, divide equally
+                num_tokens = mm_embedding.shape[0] // len(batch_mm_items)
+                request_embedding = mm_embedding[
+                    embedding_offset : embedding_offset + num_tokens
+                ]
+                # Handle remainder for last request
+                if i == len(batch_mm_items) - 1:
+                    request_embedding = mm_embedding[embedding_offset:]
+
+                results.append((image_grid_dim, request_embedding))
+                embedding_offset += num_tokens
+
+        return results
+
+    async def batch_encode(
+        self, batch_requests: List[dict]
+    ) -> List[Tuple[int, int, int]]:
+        """
+        Encode multiple requests together in a batch.
+
+        Args:
+            batch_requests: List of request dicts, each containing:
+                - mm_items: multimodal items to encode
+                - req_id: request ID
+                - num_parts: number of parts
+                - part_idx: part index
+
+        Returns:
+            List of (nbytes, embedding_len, embedding_dim) tuples for each request
+        """
+        start_time = time.time()
+
+        # Extract mm_items for batch encoding
+        batch_mm_items = [req["mm_items"] for req in batch_requests]
+
+        # Batch encode all items together
+        results = await self._batch_encode(batch_mm_items)
+
+        end_time = time.time()
+        logger.info(
+            f"🕛 batch encode cost = {(end_time - start_time) * 1000:.2f}ms for {len(batch_requests)} requests"
+        )
+
+        # Store embeddings and return metadata
+        response_list = []
+        if self.rank == 0:
+            for i, (image_grid_dim, mm_embedding) in enumerate(results):
+                req = batch_requests[i]
+                mm_data = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    image_grid_dim,
+                    mm_embedding,
+                )
+                self.embedding_to_send[mm_data.req_id] = mm_data
+                response_list.append(
+                    (mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1])
+                )
+        else:
+            for mm_embedding in [r[1] for r in results]:
+                response_list.append(
+                    (mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1])
+                )
+
+        return response_list
+
     async def _send(
         self,
         embedding: torch.Tensor,
@@ -580,6 +742,9 @@ async def run_encoder(
                 encoder.profiler.start(request)
             else:
                 encoder.profiler.stop()
+        elif isinstance(request, dict) and request.get("type") == "batch_encode":
+            # Handle batch encode request
+            await encoder.batch_encode(request["requests"])
         else:
             await encoder.encode(
                 mm_items=request["mm_items"],
@@ -675,6 +840,99 @@ async def handle_encode_request(request: dict):
         return ORJSONResponse(content=None)
 
 
+@app.post("/batch_encode")
+async def handle_batch_encode_request(request: dict):
+    """
+    Handle batch encoding request for multiple requests.
+
+    Request format:
+    {
+        "requests": [
+            {
+                "mm_items": [...],
+                "req_id": "...",
+                "num_parts": 1,
+                "part_idx": 0,
+                "prefill_host": "...",
+                "embedding_port": [...] or None
+            },
+            ...
+        ]
+    }
+    """
+    batch_requests = request.get("requests", [])
+    if len(batch_requests) == 0:
+        return ORJSONResponse(content={"results": []})
+
+    enter_time = time.time()
+
+    # Broadcast batch request to worker processes
+    batch_msg = {
+        "type": "batch_encode",
+        "requests": batch_requests,
+        "enter_time": enter_time,
+    }
+    for socket in send_sockets:
+        socket.send_pyobj(batch_msg)
+
+    # Batch encode all requests together
+    results = await encoder.batch_encode(batch_requests)
+
+    # Handle response based on transfer backend
+    if encoder.server_args.encoder_transfer_backend == "mooncake":
+        response_list = []
+        for i, (nbytes, embedding_len, embedding_dim) in enumerate(results):
+            req = batch_requests[i]
+            response_list.append(
+                {
+                    "req_id": req["req_id"],
+                    "num_parts": req["num_parts"],
+                    "part_idx": req["part_idx"],
+                    "embedding_size": nbytes,
+                    "embedding_len": embedding_len,
+                    "embedding_dim": embedding_dim,
+                }
+            )
+        return ORJSONResponse(content={"results": response_list})
+
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+        send_tasks = []
+        for req in batch_requests:
+            embedding_port = req.get("embedding_port")
+            if embedding_port is None:
+                send_tasks.append(encoder.send_with_url(req_id=req["req_id"]))
+            else:
+                assert isinstance(embedding_port, list)
+                for port in embedding_port:
+                    send_tasks.append(
+                        encoder.send(
+                            req_id=req["req_id"],
+                            prefill_host=req["prefill_host"],
+                            embedding_port=port,
+                        )
+                    )
+        await asyncio.gather(*send_tasks)
+        for req in batch_requests:
+            if req.get("embedding_port") is not None:
+                encoder.embedding_to_send.pop(req["req_id"], None)
+        return ORJSONResponse(content={"results": None})
+
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+        send_tasks = []
+        for req in batch_requests:
+            send_tasks.append(
+                encoder.send(
+                    req_id=req["req_id"],
+                    prefill_host=req["prefill_host"],
+                    embedding_port=req["embedding_port"],
+                )
+            )
+        await asyncio.gather(*send_tasks)
+        for req in batch_requests:
+            encoder.embedding_to_send.pop(req["req_id"], None)
+        return ORJSONResponse(content={"results": None})
+
+
 @app.post("/send")
 async def handle_send_request(request: dict):
     # mooncake backend
@@ -686,6 +944,49 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     encoder.embedding_to_send.pop(request["req_id"], None)
+    return ORJSONResponse(content=None)
+
+
+@app.post("/batch_send")
+async def handle_batch_send_request(request: dict):
+    """
+    Handle batch send request for mooncake backend.
+
+    Request format:
+    {
+        "requests": [
+            {
+                "req_id": "...",
+                "prefill_host": "...",
+                "embedding_port": "...",
+                "session_id": "...",
+                "buffer_address": ...
+            },
+            ...
+        ]
+    }
+    """
+    batch_requests = request.get("requests", [])
+    if len(batch_requests) == 0:
+        return ORJSONResponse(content={"results": []})
+
+    send_tasks = []
+    for req in batch_requests:
+        send_tasks.append(
+            encoder.send(
+                req_id=req["req_id"],
+                prefill_host=req["prefill_host"],
+                embedding_port=req["embedding_port"],
+                session_id=req["session_id"],
+                buffer_address=req["buffer_address"],
+            )
+        )
+
+    await asyncio.gather(*send_tasks)
+
+    for req in batch_requests:
+        encoder.embedding_to_send.pop(req["req_id"], None)
+
     return ORJSONResponse(content=None)
 
 
