@@ -406,11 +406,31 @@ class MMEncoder:
             )
 
         # Process all audios
-        audio_inputs = self.audio_processor(
-            audios=audios,
-            return_tensors="pt",
-            padding=True,
-        )
+        # Some processors (like Qwen2AudioProcessor) require text input with audio placeholder tokens
+        processor_name = self.audio_processor.__class__.__name__
+        processor_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+        }
+
+        if processor_name in {"Qwen2AudioProcessor", "Qwen3OmniMoeProcessor"}:
+            # Qwen2-Audio uses <|audio_bos|><|AUDIO|><|audio_eos|> as placeholder
+            # Generate a placeholder text with the correct number of audio tokens
+            audio_placeholder = "<|audio_bos|><|AUDIO|><|audio_eos|>"
+            placeholder_text = " ".join([audio_placeholder] * len(audios))
+            processor_kwargs["text"] = [placeholder_text]
+            processor_kwargs["audio"] = audios
+            processor_kwargs["audio_kwargs"] = {"truncation": False}
+        elif processor_name in {"Gemma3nProcessor", "GlmAsrProcessor"}:
+            processor_kwargs["audio"] = audios
+            processor_kwargs["audio_kwargs"] = {"truncation": False}
+            # Some processors may still need text
+            if processor_name == "GlmAsrProcessor":
+                processor_kwargs["text"] = [""]
+        else:
+            processor_kwargs["audios"] = audios
+
+        audio_inputs = self.audio_processor(**processor_kwargs)
 
         # Get feature and feature_attention_mask
         feature = audio_inputs.get("input_features")
