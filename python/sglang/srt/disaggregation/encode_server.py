@@ -613,11 +613,16 @@ class MMEncoder:
         """
         start_time = time.time()
 
-        # Extract mm_items for batch encoding
-        batch_mm_items = [req["mm_items"] for req in batch_requests]
-
-        # Batch encode all items together
-        results = await self._batch_encode(batch_mm_items)
+        # For single request, use the original _encode method to ensure compatibility
+        if len(batch_requests) == 1:
+            req = batch_requests[0]
+            image_grid_dim, mm_embedding = await self._encode(req["mm_items"])
+            results = [(image_grid_dim, mm_embedding)]
+        else:
+            # Extract mm_items for batch encoding
+            batch_mm_items = [req["mm_items"] for req in batch_requests]
+            # Batch encode all items together
+            results = await self._batch_encode(batch_mm_items)
 
         end_time = time.time()
         logger.info(
