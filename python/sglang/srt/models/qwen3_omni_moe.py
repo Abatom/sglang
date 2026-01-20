@@ -422,16 +422,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
+        # Set encoder_only and language_only flags before calling super().__init__
+        # These flags control EPD (Encoder-Projector-Decoder) separation
+        self._encoder_only = getattr(config, "encoder_only", False)
+        self._language_only = getattr(config, "language_only", False)
+
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
-        self.visual = Qwen3OmniMoeVisionEncoder(
-            config.vision_config,
-            quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
-        )
+
+        # Only create audio/vision encoders when not in language_only mode
+        if not self._language_only:
+            self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
+            self.visual = Qwen3OmniMoeVisionEncoder(
+                config.vision_config,
+                quant_config=quant_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("visual", prefix),
+            )
+
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
@@ -477,12 +486,34 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         super().__init__(config)
         self.config = config
 
+        # EPD (Encoder-Projector-Decoder) separation flags
+        self._encoder_only = getattr(config, "encoder_only", False)
+        self._language_only = getattr(config, "language_only", False)
+
+        # Pass EPD flags to thinker_config
+        config.thinker_config.encoder_only = self._encoder_only
+        config.thinker_config.language_only = self._language_only
+
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config.thinker_config, quant_config=quant_config, prefix=prefix
         )
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
+
+        # Expose multimodal feature methods from thinker for EPD separation
+        if not self._language_only:
+            self.get_audio_feature = self.thinker.get_audio_feature
+            self.get_image_feature = self.thinker.get_image_feature
+            self.get_video_feature = self.thinker.get_video_feature
+
+        # Expose deepstack-related attributes for multimodal embedding
+        if hasattr(self.thinker, "deepstack_visual_indexes"):
+            self.deepstack_visual_indexes = self.thinker.deepstack_visual_indexes
+        if hasattr(self.thinker, "use_deepstack"):
+            self.use_deepstack = self.thinker.use_deepstack
+        if hasattr(self.thinker, "separate_deepstack_embeds"):
+            self.separate_deepstack_embeds = self.thinker.separate_deepstack_embeds
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -534,6 +565,18 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:
                 continue
 
+            # EPD separation: skip encoder weights when in language_only mode
+            if self._language_only and (
+                "visual" in name or "audio_tower" in name or "merger" in name
+            ):
+                continue
+
+            # EPD separation: skip language model weights when in encoder_only mode
+            if self._encoder_only and not (
+                "visual" in name or "audio_tower" in name or "merger" in name
+            ):
+                continue
+
             name = name.replace(".self_attn.out_proj", ".self_attn.proj")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -579,6 +622,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                     if weight_name not in name:
                         continue
                     if "visual" in name or "audio_tower" in name:
+                        continue
+                    # EPD separation: skip expert weights when in encoder_only mode
+                    if self._encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -646,6 +692,12 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+
+                    # Skip loading mm/language parameters based on EPD flags
+                    if (
+                        self._encoder_only or self._language_only
+                    ) and name not in params_dict:
                         continue
 
                     if name in params_dict.keys():
