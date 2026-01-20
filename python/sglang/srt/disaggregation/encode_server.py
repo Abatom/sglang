@@ -17,7 +17,7 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
-from transformers import AutoImageProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -106,6 +106,10 @@ def _get_image_grid_dim(images_input):
     )
 
 
+# Audio model types that don't have image processors
+_AUDIO_MODEL_TYPES = {"qwen2_audio"}
+
+
 class MMEncoder:
     def __init__(
         self,
@@ -120,11 +124,30 @@ class MMEncoder:
         self.rank = rank
         self.profiler = EncoderProfiler(rank)
 
-        self.image_processor = AutoImageProcessor.from_pretrained(
+        # Detect model type to load appropriate processor
+        hf_config = AutoConfig.from_pretrained(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            use_fast=True,
         )
+        model_type = getattr(hf_config, "model_type", "")
+        self.is_audio_model = model_type in _AUDIO_MODEL_TYPES
+
+        # Load appropriate processor based on model type
+        self.image_processor = None
+        self.audio_processor = None
+
+        if self.is_audio_model:
+            logger.info(f"Detected audio model type: {model_type}")
+            self.audio_processor = AutoProcessor.from_pretrained(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+        else:
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                use_fast=True,
+            )
 
         self.model_config = ModelConfig.from_server_args(
             server_args,
@@ -291,6 +314,11 @@ class MMEncoder:
             return await asyncio.gather(*async_futures)
 
     async def _encode(self, mm_items) -> torch.Tensor:
+        if self.image_processor is None:
+            raise ValueError(
+                "Image processor not initialized. This model may not support image encoding."
+            )
+
         images = await self._flatten_and_load_images(mm_items)
 
         kwargs = {"device": self.device} if self.use_image_processor_gpu else {}
@@ -369,18 +397,16 @@ class MMEncoder:
         Returns:
             Tuple of (audio_feature_lens, audio_embeddings)
         """
-        from transformers import AutoProcessor
-
         audios = await self._flatten_and_load_audios(mm_items)
 
-        # Use the processor to get audio features
-        processor = AutoProcessor.from_pretrained(
-            self.server_args.model_path,
-            trust_remote_code=self.server_args.trust_remote_code,
-        )
+        # Use the stored audio processor
+        if self.audio_processor is None:
+            raise ValueError(
+                "Audio processor not initialized. This model may not support audio encoding."
+            )
 
         # Process all audios
-        audio_inputs = processor(
+        audio_inputs = self.audio_processor(
             audios=audios,
             return_tensors="pt",
             padding=True,
