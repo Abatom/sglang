@@ -399,6 +399,7 @@ class ModelConfig:
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
+            "MiMoV2OmniForCausalLM",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
         ]
@@ -1368,6 +1369,7 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    "MiMoV2OmniForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1514,6 +1516,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "MiMoV2OmniForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
         "Gemma4ForCausalLM",
@@ -1542,7 +1545,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif "MiMoV2FlashForCausalLM" in model_architectures:
+    elif "MiMoV2FlashForCausalLM" in model_architectures or "MiMoV2OmniForCausalLM" in model_architectures:
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
