@@ -400,6 +400,7 @@ class ModelConfig:
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
+            "MiMoV2OmniForCausalLM",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
         ]
@@ -1376,6 +1377,7 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    "MiMoV2OmniForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1523,6 +1525,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "MiMoV2OmniForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
         "Gemma4ForCausalLM",
@@ -1556,6 +1559,7 @@ def get_hybrid_layer_ids(
         for x in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
+            "MiMoV2OmniForCausalLM",
         )
     ):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
