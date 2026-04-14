@@ -1,6 +1,7 @@
 from typing import Literal, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from PIL import Image
+import numpy as np
 import torch
 
 try:
@@ -57,12 +58,13 @@ class AudioInput:
     if audio is str or bytes, only load it as mel spectrogram.
     if audio is tuple, it is (waveform, original_sr)
     if audio is torch.Tensor, it is tokenized input ids with shape (T, n_vq+).
+    if audio is np.ndarray, it is a pre-loaded waveform (1D, already resampled).
     """
-    audio: str | bytes | tuple | torch.Tensor
-    
+    audio: str | bytes | tuple | torch.Tensor | np.ndarray
+
     def __post_init__(self):
-        if not isinstance(self.audio, (str, bytes, tuple, torch.Tensor)):
-            raise ValueError(f"audio must be a str, bytes, or torch.Tensor, but got {type(self.audio)}")
+        if not isinstance(self.audio, (str, bytes, tuple, torch.Tensor, np.ndarray)):
+            raise ValueError(f"audio must be a str, bytes, tuple, torch.Tensor, or np.ndarray, but got {type(self.audio)}")
         if isinstance(self.audio, tuple):
             if len(self.audio) != 2 or not isinstance(self.audio[0], torch.Tensor) or not isinstance(self.audio[1], (int, float)):
                 raise ValueError(f"audio must be a tuple of (waveform-T, original_sr-int/float), but got {len(self.audio)} elements and {type(self.audio[0])} and {type(self.audio[1])}")

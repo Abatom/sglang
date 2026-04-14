@@ -709,10 +709,13 @@ class MiMoVLProcessor:
         """
         - Input: AudioInput
         - Output:
-            - Inference: audio is str/bytes, return mel_spectrogram and number of tokens
+            - Inference: audio is str/bytes/np.ndarray, return mel_spectrogram and number of tokens
             - Training: audio is torch.Tensor, return padded_audio
         """
         audio = audio.audio
+        if isinstance(audio, np.ndarray):
+            waveform = torch.from_numpy(audio).float()
+            audio = (waveform, self.audio_sampling_rate)
         if isinstance(audio, (str, bytes, tuple)):
             audio_spec, audio_token_len = self.preprocess_audio(audio)
             return audio_spec, audio_token_len
