@@ -1038,8 +1038,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                     loaded_audio = next(loaded_audio_iter)
                     raw_audio_item = next(raw_audio_iter)
 
-                    audio_source = loaded_audio
-                    if isinstance(raw_audio_item, dict):
+                    if isinstance(loaded_audio, np.ndarray):
+                        audio_source = loaded_audio
+                    elif isinstance(raw_audio_item, dict):
                         audio_source = raw_audio_item.get("url", loaded_audio)
                     elif isinstance(raw_audio_item, (str, bytes, torch.Tensor)):
                         audio_source = raw_audio_item
