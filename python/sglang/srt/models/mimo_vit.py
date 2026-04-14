@@ -1,35 +1,26 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type
+from functools import partial
+from typing import Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers.activations import ACT2FN
-
-
-from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.models.mimo_vision_attention import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.models.mimo_vision_attention import VisionAttention
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
 from sglang.srt.server_args import get_global_server_args
-
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding
-
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding,
+)
 
 
 class Mimo_VLVisionConfig(PretrainedConfig):
@@ -86,6 +77,7 @@ class Mimo_VLVisionConfig(PretrainedConfig):
         self.vit_window_attn_types = vit_window_attn_types or [-1] * depth
         self.visual_token_window_size = visual_token_window_size
 
+
 class Mimo_VisionPatchEmbed(nn.Module):
     def __init__(
         self,
@@ -101,7 +93,13 @@ class Mimo_VisionPatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         kernel_size = [temporal_patch_size, patch_size, patch_size]
-        self.proj = nn.Conv3d(in_channels, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False)
+        self.proj = nn.Conv3d(
+            in_channels,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=False,
+        )
         self.proj_weight_linear_format = None
 
     @torch.no_grad()
@@ -110,12 +108,13 @@ class Mimo_VisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = F.linear(hidden_states.to(dtype=target_dtype), self.proj_weight_linear_format)
+        hidden_states = F.linear(
+            hidden_states.to(dtype=target_dtype), self.proj_weight_linear_format
+        )
         return hidden_states
 
 
 class Mimo_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -229,233 +228,7 @@ class Mimo_VisionBlock(nn.Module):
         return x
 
 
-VIT_CUDA_GRAPH_BUCKET_SIZES = list(range(1024, 16384 + 1, 1024))
-VIT_CUDA_GRAPH_CU_SEQLENS_BUCKET_SIZES = [2, 3, 5, 9]
-
-
-class MimoViTCudaGraphRunner:
-    def __init__(self, vit: "Mimo_VisionTransformer"):
-        self.vit = vit
-        self.graphs: dict = {}
-        self.block_input: dict = {}
-        self.block_output: dict = {}
-        self.row_emb_ws: dict = {}
-        self.col_emb_ws: dict = {}
-        self.window_index_col_ws: dict = {}
-        self.reverse_index_col_ws: dict = {}
-        self.cu_seqlens_ws: dict = {}
-        self.server_args = get_global_server_args()
-        self.bucket_sizes = getattr(
-            self.server_args,
-            "vit_cuda_graph_bucket_sizes",
-            None
-        ) or VIT_CUDA_GRAPH_BUCKET_SIZES
-        self.cu_seqlens_bucket_sizes = getattr(
-            self.server_args,
-            "vit_cuda_graph_cu_seqlens_bucket_sizes",
-            None
-        ) or VIT_CUDA_GRAPH_CU_SEQLENS_BUCKET_SIZES
-
-
-    def _get_bucket_size(self, seq_len: int) -> Optional[int]:
-        import bisect
-        if not self.bucket_sizes:
-            return None
-        idx = bisect.bisect_left(self.bucket_sizes, seq_len)
-        if idx >= len(self.bucket_sizes):
-            return None
-        return self.bucket_sizes[idx]
-
-    def _get_cu_seqlens_bucket_size(self, cu_seqlens_len: int) -> Optional[int]:
-        import bisect
-        if not self.cu_seqlens_bucket_sizes:
-            return None
-        idx = bisect.bisect_left(self.cu_seqlens_bucket_sizes, cu_seqlens_len)
-        if idx >= len(self.cu_seqlens_bucket_sizes):
-            return None
-        return self.cu_seqlens_bucket_sizes[idx]
-
-    @torch.no_grad()
-    def capture_all_graphs(self):
-        device = self.vit.device
-        dtype = self.vit.dtype
-        hidden_size = self.vit.vision_config.hidden_size
-        qk_channels = self.vit.qk_channels
-        head_dim = qk_channels if qk_channels is not None else (
-            hidden_size // self.vit.vision_config.num_heads
-        )
-        rotary_dim = head_dim
-        spatial_merge_unit = self.vit.spatial_merge_unit
-        num_keys = len(self.bucket_sizes) * len(self.cu_seqlens_bucket_sizes)
-
-        logger.info(
-            "Pre-capturing %d CUDA graphs (%d bucket_sizes x %d cu_seqlens_buckets)...",
-            num_keys,
-            len(self.bucket_sizes),
-            len(self.cu_seqlens_bucket_sizes),
-        )
-
-        for bucket_size in self.bucket_sizes:
-            for cu_seqlens_bucket in self.cu_seqlens_bucket_sizes:
-                graph_key = (bucket_size, cu_seqlens_bucket)
-
-                x = torch.zeros(bucket_size, 1, hidden_size, device=device, dtype=dtype)
-                row_emb = (
-                    torch.zeros(bucket_size, rotary_dim, device=device, dtype=dtype),
-                    torch.zeros(bucket_size, rotary_dim, device=device, dtype=dtype),
-                )
-                col_emb = (
-                    torch.zeros(bucket_size, rotary_dim, device=device, dtype=dtype),
-                    torch.zeros(bucket_size, rotary_dim, device=device, dtype=dtype),
-                )
-                num_groups = bucket_size // spatial_merge_unit
-                window_index = torch.arange(num_groups, device=device)
-                reverse_index = torch.arange(num_groups, device=device)
-
-                cu_seqlens = torch.zeros(cu_seqlens_bucket, device=device, dtype=torch.int32)
-                cu_seqlens[1:] = bucket_size
-
-                for _ in range(3):
-                    self.vit.run_blocks(
-                        x, row_emb, col_emb,
-                        window_index, reverse_index,
-                        cu_seqlens, bucket_size,
-                    )
-                torch.cuda.synchronize()
-
-                self._create_graph(
-                    graph_key, x, row_emb, col_emb,
-                    window_index, reverse_index,
-                    cu_seqlens, bucket_size,
-                )
-                logger.info("Captured CUDA graph for key=%s", graph_key)
-
-        torch.cuda.synchronize()
-        logger.info("All %d CUDA graphs captured.", num_keys)
-
-    def _pad_to_bucket(
-        self,
-        real_seq_len: int,
-        bucket_size: int,
-        x: torch.Tensor,
-        row_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        col_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        window_index_1d_col: torch.Tensor,
-        reverse_window_index_1d_col: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ):
-        pad_len = bucket_size - real_seq_len
-        device = x.device
-
-        x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
-        row_based_embeddings = tuple(F.pad(t, (0, 0, 0, pad_len)) for t in row_based_embeddings)
-        col_based_embeddings = tuple(F.pad(t, (0, 0, 0, pad_len)) for t in col_based_embeddings)
-
-        real_groups = real_seq_len // self.vit.spatial_merge_unit
-        pad_groups = pad_len // self.vit.spatial_merge_unit
-        pad_idx = torch.arange(
-            real_groups, real_groups + pad_groups, device=device
-        )
-        window_index_1d_col = torch.cat([window_index_1d_col, pad_idx])
-        reverse_window_index_1d_col = torch.cat([reverse_window_index_1d_col, pad_idx])
-
-        cu_seqlens = torch.cat([
-            cu_seqlens,
-            torch.tensor([bucket_size], device=device, dtype=torch.int32),
-        ])
-
-        return (
-            x, row_based_embeddings, col_based_embeddings,
-            window_index_1d_col, reverse_window_index_1d_col, cu_seqlens,
-        )
-
-    def _create_graph(
-        self,
-        graph_key,
-        x: torch.Tensor,
-        row_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        col_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        window_index_1d_col: torch.Tensor,
-        reverse_window_index_1d_col: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ):
-        self.block_input[graph_key] = x.clone()
-        self.row_emb_ws[graph_key] = tuple(t.clone() for t in row_based_embeddings)
-        self.col_emb_ws[graph_key] = tuple(t.clone() for t in col_based_embeddings)
-        self.window_index_col_ws[graph_key] = window_index_1d_col.clone()
-        self.reverse_index_col_ws[graph_key] = reverse_window_index_1d_col.clone()
-        self.cu_seqlens_ws[graph_key] = cu_seqlens.clone()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self.block_output[graph_key] = self.vit.run_blocks(
-                self.block_input[graph_key],
-                self.row_emb_ws[graph_key],
-                self.col_emb_ws[graph_key],
-                self.window_index_col_ws[graph_key],
-                self.reverse_index_col_ws[graph_key],
-                self.cu_seqlens_ws[graph_key],
-                max_seqlen,
-            )
-        self.graphs[graph_key] = graph
-
-    def run(
-        self,
-        x: torch.Tensor,
-        row_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        col_based_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        window_index_1d_col: torch.Tensor,
-        reverse_window_index_1d_col: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        real_seq_len = x.shape[0]
-        bucket_size = self._get_bucket_size(real_seq_len)
-        pad_len = bucket_size - real_seq_len
-
-        if pad_len > 0:
-            (
-                x, row_based_embeddings, col_based_embeddings,
-                window_index_1d_col, reverse_window_index_1d_col, cu_seqlens,
-            ) = self._pad_to_bucket(
-                real_seq_len, bucket_size,
-                x, row_based_embeddings, col_based_embeddings,
-                window_index_1d_col, reverse_window_index_1d_col, cu_seqlens,
-            )
-
-        cu_seqlens_bucket = self._get_cu_seqlens_bucket_size(cu_seqlens.shape[0])
-        cu_seqlens_pad = cu_seqlens_bucket - cu_seqlens.shape[0]
-        if cu_seqlens_pad > 0:
-            last_val = cu_seqlens[-1:].expand(cu_seqlens_pad)
-            cu_seqlens = torch.cat([cu_seqlens, last_val])
-
-        graph_key = (bucket_size, cu_seqlens_bucket)
-        if graph_key not in self.graphs:
-            raise KeyError(
-                f"CUDA graph for key {graph_key} (bucket_size={bucket_size}, cu_seqlens_bucket={cu_seqlens_bucket}) "
-                "was not pre-captured. Ensure capture_all_graphs() has been called with matching bucket sizes."
-            )
-
-        self.block_input[graph_key].copy_(x)
-        for ws, src in zip(self.row_emb_ws[graph_key], row_based_embeddings):
-            ws.copy_(src)
-        for ws, src in zip(self.col_emb_ws[graph_key], col_based_embeddings):
-            ws.copy_(src)
-        self.window_index_col_ws[graph_key].copy_(window_index_1d_col)
-        self.reverse_index_col_ws[graph_key].copy_(reverse_window_index_1d_col)
-        self.cu_seqlens_ws[graph_key].copy_(cu_seqlens)
-
-        self.graphs[graph_key].replay()
-
-        logger.info("MimoViTCudaGraphRunner: key %s, real_len %s, max_len %s, pad_len %s", graph_key, real_seq_len, max_seqlen, pad_len)
-        if pad_len > 0:
-            return self.block_output[graph_key][: real_seq_len // self.vit.spatial_merge_unit]
-        return self.block_output[graph_key]
-
-
 class Mimo_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: Mimo_VLVisionConfig,
@@ -534,15 +307,13 @@ class Mimo_VisionTransformer(nn.Module):
 
         self.vision_config = vision_config
         self.merger = Qwen2_5_VisionPatchMerger(
-                dim=vision_config.out_hidden_size,
-                context_dim=hidden_size,
-                spatial_merge_size=spatial_merge_size,
-                quant_config=quant_config,
-                prefix=add_prefix("merger", prefix),
-                use_data_parallel=self.use_data_parallel,
+            dim=vision_config.out_hidden_size,
+            context_dim=hidden_size,
+            spatial_merge_size=spatial_merge_size,
+            quant_config=quant_config,
+            prefix=add_prefix("merger", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
-        self.cuda_graph_runner = MimoViTCudaGraphRunner(self)
-        self.use_cuda_graph = self.server_args.enable_vit_cuda_graph
         self._post_init()
 
     def apply_index(self, tensor: torch.Tensor, index: torch.Tensor):
@@ -550,10 +321,6 @@ class Mimo_VisionTransformer(nn.Module):
         tensor = tensor[index]
         tensor = tensor.flatten(0, 1)
         return tensor
-
-    @torch.no_grad()
-    def capture_all_graphs(self):
-        self.cuda_graph_runner.capture_all_graphs()
 
     def _post_init(self):
         for name, param in self.named_parameters():
@@ -577,7 +344,10 @@ class Mimo_VisionTransformer(nn.Module):
                 index_new = index.reshape(-1)
             window_index.append(index_new + window_index_id)
             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
-        window_index = torch.cat(window_index, dim=0,)
+        window_index = torch.cat(
+            window_index,
+            dim=0,
+        )
         return window_index
 
     @property
@@ -653,7 +423,9 @@ class Mimo_VisionTransformer(nn.Module):
             return position_embeddings
 
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
-        seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+        seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        )
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
@@ -663,7 +435,9 @@ class Mimo_VisionTransformer(nn.Module):
         max_seqlen = seqlens.max().item()
 
         row_based_embeddings = get_position_embeddings(emb, x)
-        col_based_embeddings = get_position_embeddings(self.apply_index(emb, window_index_1d_col), x)
+        col_based_embeddings = get_position_embeddings(
+            self.apply_index(emb, window_index_1d_col), x
+        )
 
         # transformers
         x = x.unsqueeze(1)  # [S, 1, H]
@@ -692,13 +466,21 @@ class Mimo_VisionTransformer(nn.Module):
             window_attn_type = self.vit_window_attn_types[layer_num]
 
             # window_attn_type = 1: col-based SWA
-            if window_attn_type == 1 and (layer_num == 0 or self.vit_window_attn_types[layer_num - 1] != 1):
+            if window_attn_type == 1 and (
+                layer_num == 0 or self.vit_window_attn_types[layer_num - 1] != 1
+            ):
                 x = self.apply_index(x, window_index_1d_col)
 
-            if layer_num > 0 and window_attn_type != 1 and self.vit_window_attn_types[layer_num - 1] == 1:
+            if (
+                layer_num > 0
+                and window_attn_type != 1
+                and self.vit_window_attn_types[layer_num - 1] == 1
+            ):
                 x = self.apply_index(x, reverse_window_index_1d_col)
 
-            position_embeddings = col_based_embeddings if window_attn_type == 1 else row_based_embeddings
+            position_embeddings = (
+                col_based_embeddings if window_attn_type == 1 else row_based_embeddings
+            )
             full_attn = layer_num in self.fullatt_block_indexes
 
             # logger.info(f"layer {layer_num} window_attn_type: {window_attn_type}, cu_seqlens: {cu_seqlens}, max_seqlen: {max_seqlen}")
@@ -727,22 +509,6 @@ class Mimo_VisionTransformer(nn.Module):
             max_seqlen,
         ) = self._prepare_forward(x, grid_thw)
 
-        if (
-            self.use_cuda_graph
-            and x.shape[0] <= self.cuda_graph_runner.bucket_sizes[-1]
-            and cu_seqlens.shape[0] < self.cuda_graph_runner.cu_seqlens_bucket_sizes[-1]
-        ):
-            # TODO: Optimize the range determination of cu_seqlens
-            return self.cuda_graph_runner.run(
-                x,
-                row_based_embeddings,
-                col_based_embeddings,
-                window_index_1d_col,
-                reverse_window_index_1d_col,
-                cu_seqlens,
-                max_seqlen,
-            )
-
         return self.run_blocks(
             x,
             row_based_embeddings,
@@ -752,5 +518,3 @@ class Mimo_VisionTransformer(nn.Module):
             cu_seqlens,
             max_seqlen,
         )
-
-cached_get_processor = lru_cache(get_processor)

@@ -1,15 +1,16 @@
 from __future__ import annotations
-import logging
+
 import dataclasses
 import functools
+import logging
 import math
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import (
     get_device_capability,
@@ -21,8 +22,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
-    # from sgl_kernel.flash_attn import flash_attn_varlen_func
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -50,6 +50,7 @@ ROTARY_EMBED_CLASSES = {
 # 配置日志记录到文件
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
 
 @dataclasses.dataclass
 class SingletonCache:
@@ -311,17 +312,16 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        output, softmax_lse = flash_attn_varlen_func(
-            q,
-            k,
-            v,
+        fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             window_size=window_size,
-            s_aux=s_aux,
         )
+        if s_aux is not None:
+            fa_kwargs["sinks"] = s_aux
+        output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
 
         return output
 
@@ -397,7 +397,9 @@ class VisionAttention(nn.Module):
 
         # Additional dummy heads are used to enable TP for common GPU counts.
         # Use qk_channels for dummy_dim if provided, otherwise use head_size
-        effective_head_dim = self.qk_channels if qk_channels is not None else self.head_size
+        effective_head_dim = (
+            self.qk_channels if qk_channels is not None else self.head_size
+        )
         self.dummy_dim = (num_dummy_heads + num_heads) * effective_head_dim
 
         if self.qk_normalization:
@@ -427,7 +429,11 @@ class VisionAttention(nn.Module):
             # Init and load full sharded sink parameters
             # But use only the local partition in attention forward
             self.sinks = nn.Parameter(
-                torch.empty(self.num_attention_heads_per_partition * self.tp_size, dtype=torch.bfloat16), requires_grad=False
+                torch.empty(
+                    self.num_attention_heads_per_partition * self.tp_size,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
             )
         else:
             self.sinks = None
@@ -448,7 +454,9 @@ class VisionAttention(nn.Module):
         self.use_qkv_parallel = use_qkv_parallel
         if use_qkv_parallel:
             # Use qk_channels as head_size if provided (for GQA with custom head dims)
-            effective_head_size = self.qk_channels if qk_channels is not None else self.head_size
+            effective_head_size = (
+                self.qk_channels if qk_channels is not None else self.head_size
+            )
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
                 head_size=effective_head_size,
@@ -625,7 +633,9 @@ class VisionAttention(nn.Module):
             window_size = self.window_size
             q_head_start = self.tp_rank * self.num_attention_heads_per_partition
             q_head_end = (self.tp_rank + 1) * self.num_attention_heads_per_partition
-            s_aux = self.sinks[q_head_start: q_head_end] if self.sinks is not None else None
+            s_aux = (
+                self.sinks[q_head_start:q_head_end] if self.sinks is not None else None
+            )
 
         output = self.qkv_backend.forward(
             q=q,

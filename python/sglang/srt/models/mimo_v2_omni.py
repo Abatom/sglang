@@ -15,36 +15,33 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+
 import logging
-import torch
 from typing import Iterable, List, Optional, Tuple
 
+import torch
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-)
-from sglang.srt.utils import add_prefix
-
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
+from sglang.srt.models.mimo_audio import MimoAudioEncoder, MimoAudioEncoderConfig
 from sglang.srt.models.mimo_v2_flash import (
     MiMoV2FlashForCausalLM,
 )
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
-    Qwen2_5_VLConfig,
-    Qwen2_5_VLVisionConfig,
-)
-from sglang.srt.models.mimo_audio import MimoAudioEncoder, MimoAudioEncoderConfig
 from sglang.srt.models.mimo_vit import Mimo_VisionTransformer, Mimo_VLVisionConfig
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +49,6 @@ MiMoV2OmniConfig = None
 
 
 class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
-
     def __init__(
         self,
         config: MiMoV2OmniConfig,
@@ -136,7 +132,11 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
-                    input_ids, hidden_states, self.lm_head, forward_batch, hidden_states_before_norm=hidden_states_before_norm
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    hidden_states_before_norm=hidden_states_before_norm,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
@@ -188,39 +188,63 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
                 # logger.info(f"loading audio weights: {name}")
 
                 if "projection" in name:
-                    if "audio_encoder.audio_projection" in name and "audio_encoder.projection" not in name:
-                        name = name.replace("audio_encoder.audio_projection", "audio_encoder.projection")
-                    elif "audio_projection" in name and "audio_encoder.projection" not in name:
-                        name = name.replace("audio_projection", "audio_encoder.projection")
+                    if (
+                        "audio_encoder.audio_projection" in name
+                        and "audio_encoder.projection" not in name
+                    ):
+                        name = name.replace(
+                            "audio_encoder.audio_projection", "audio_encoder.projection"
+                        )
+                    elif (
+                        "audio_projection" in name
+                        and "audio_encoder.projection" not in name
+                    ):
+                        name = name.replace(
+                            "audio_projection", "audio_encoder.projection"
+                        )
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
 
                     weight_loader(param, loaded_weight)
                     continue
 
                 if "input_local_transformer" in name:
-                    if "audio_input_local_transformer" in name and "audio_encoder.input_local_transformer" not in name:
-                        name = name.replace("audio_input_local_transformer", "audio_encoder.input_local_transformer")
+                    if (
+                        "audio_input_local_transformer" in name
+                        and "audio_encoder.input_local_transformer" not in name
+                    ):
+                        name = name.replace(
+                            "audio_input_local_transformer",
+                            "audio_encoder.input_local_transformer",
+                        )
                     if name not in params_dict:
-                        logger.warning(f"Parameter {name} not found in params_dict, skipping")
+                        logger.warning(
+                            f"Parameter {name} not found in params_dict, skipping"
+                        )
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     continue
 
             if "speech_embeddings" in name:
-
                 # logger.info(f"loading speech weights: {name}")
 
-                if "speech_embeddings" in name and "audio_encoder.speech_embeddings" not in name:
-                    name = name.replace("speech_embeddings", "audio_encoder.speech_embeddings")
+                if (
+                    "speech_embeddings" in name
+                    and "audio_encoder.speech_embeddings" not in name
+                ):
+                    name = name.replace(
+                        "speech_embeddings", "audio_encoder.speech_embeddings"
+                    )
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight[:param.shape[0], :])
+                weight_loader(param, loaded_weight[: param.shape[0], :])
                 continue
-
-
 
             if "visual" in name:
                 name = name.replace("vision_model.", "")
@@ -295,6 +319,16 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
             if "mtp" in name:
                 continue
 
+            # Checkpoint stores fused qkv_proj; manually chunk for TP
+            if "qkv_proj" in name:
+                if name in params_dict:
+                    tp_size = get_attention_tp_size()
+                    tp_rank = get_attention_tp_rank()
+                    param = params_dict[name]
+                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+                    default_weight_loader(param, loaded_weight)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if (
                     "compression_attention" in name
@@ -357,7 +391,7 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
                         if "attention_sink_bias" in name:
                             start = get_attention_tp_rank() * param.numel()
                             param.data.copy_(
-                                loaded_weight[start: start + param.numel()]
+                                loaded_weight[start : start + param.numel()]
                             )
                         else:
                             weight_loader = getattr(

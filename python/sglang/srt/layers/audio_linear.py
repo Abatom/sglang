@@ -1,11 +1,13 @@
 # copied from https://github.com/XiaomiMiMo/MiMo-Audio-Tokenizer/blob/main/mimo_audio_tokenizer/modules/quantizer.py
-import torch
-from torch import nn
-import torch.nn.functional as F
-import torch.distributed as dist
 import typing as tp
 from functools import wraps
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch import nn
+
 
 def rank():
     if dist.is_initialized():
@@ -52,7 +54,6 @@ def sample_vectors(samples, num: int):
     selected_samples = samples[indices]
 
     if dist.is_initialized():
-
         dist.broadcast(selected_samples, src=0)
 
     return selected_samples
@@ -91,10 +92,12 @@ def kmeans(samples, num_clusters: int, num_iters: int = 10):
 
     return means, bins
 
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -117,7 +120,9 @@ def _compute_default_rope_parameters(
     elif config is not None:
         base = config.rope_theta
         partial_rotary_factor = (
-            config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
         )
         head_dim = (
             getattr(config, "head_dim", None)
@@ -126,7 +131,13 @@ def _compute_default_rope_parameters(
         dim = int(head_dim * partial_rotary_factor)
     attention_factor = 1.0
     inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64).to(
+                device=device, dtype=torch.float
+            )
+            / dim
+        )
     )
     return inv_freq, attention_factor
 
@@ -137,7 +148,6 @@ ROPE_INIT_FUNCTIONS = {
 
 
 def _dynamic_rope_update(rope_forward):
-
     def longrope_frequency_update(self, position_ids, device):
         seq_len = torch.max(position_ids) + 1
         if hasattr(self.config, "original_max_position_embeddings"):
@@ -189,7 +199,6 @@ def _dynamic_rope_update(rope_forward):
 
 
 class AudioRotaryEmbedding(nn.Module):
-
     def __init__(self, base, dim, max_seq_len, rope_type="default", device=None):
         super().__init__()
         self.max_seq_len = max_seq_len
