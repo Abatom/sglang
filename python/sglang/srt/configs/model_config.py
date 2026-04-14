@@ -400,8 +400,6 @@ class ModelConfig:
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
             "MiMoV2OmniForCausalLM",
-            "Gemma4ForCausalLM",
-            "Gemma4ForConditionalGeneration",
         ]
 
     def _detect_attention_sinks(self) -> bool:

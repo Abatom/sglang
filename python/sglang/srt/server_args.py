@@ -305,6 +305,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    audio_tokenizer_path: Optional[str] = None
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -4095,6 +4096,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--audio-tokenizer",
+            "--audio-tokenizer-path",
+            dest="audio_tokenizer_path",
+            type=str,
+            default=ServerArgs.audio_tokenizer_path,
+            help="The path of the audio tokenizer.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",

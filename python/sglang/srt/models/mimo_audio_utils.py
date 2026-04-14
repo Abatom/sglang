@@ -1,8 +1,11 @@
 import torch
 
+
 def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: int):
     if features.size(0) != lengths.sum().item():
-        raise ValueError(f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}")
+        raise ValueError(
+            f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}"
+        )
 
     split_points = []
     current_sum = 0
@@ -31,15 +34,18 @@ def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: i
 
 
 @torch.no_grad()
-def encode_batch(audio_tokenizer_encoder, input_features: torch.Tensor, input_lens: torch.Tensor, max_length: int = 256000):
+def encode_batch(
+    audio_tokenizer_encoder,
+    input_features: torch.Tensor,
+    input_lens: torch.Tensor,
+    max_length: int = 256000,
+):
     feature_groups, len_groups = group_by_length(input_features, input_lens, max_length)
 
     encoded_parts = []
     for features, lengths in zip(feature_groups, len_groups):
         codes, _ = audio_tokenizer_encoder.encode(  # codes are also packed
-            input_features=features,
-            input_lens=lengths,
-            return_codes_only=True
+            input_features=features, input_lens=lengths, return_codes_only=True
         )
         encoded_parts.append(codes)
 
