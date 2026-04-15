@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -288,7 +289,9 @@ class MimoAudioEncoder(nn.Module):
                 f"Invalid projection layers: {self.config.projection_layers}"
             )
 
-        audio_tokenizer_path = self.server_args.audio_tokenizer_path
+        audio_tokenizer_path = os.path.join(
+            self.server_args.model_path, "audio_tokenizer"
+        )
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.audio_tokenizer = self._load_audio_tokenizer(
             audio_tokenizer_path, dev
