@@ -47,9 +47,7 @@ ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
 
-# 配置日志记录到文件
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 @dataclasses.dataclass
