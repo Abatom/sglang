@@ -18,17 +18,10 @@ from transformers.utils import logging
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
-    except Exception:
-        try:
-            from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
-        except Exception:
-            try:
-                from flash_attn.flash_attn_interface import flash_attn_varlen_func
-            except Exception:
-                flash_attn_varlen_func = None
+if not _is_cuda:
+    raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+
+from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 logger = logging.get_logger(__name__)
 
