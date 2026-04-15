@@ -4,6 +4,8 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
+import os
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -1523,6 +1525,66 @@ def get_new_expanded_mm_items(original_mm_items):
     return expanded_mm_items
 
 
+class _ShmHandle:
+    """Lightweight handle that opens an existing POSIX shared memory segment.
+
+    Unlike ``SharedMemory(create=False)``, this does **not** call
+    ``shm_unlink`` when ``mmap`` fails (Python's ``SharedMemory.__init__``
+    has ``except OSError: self.unlink()`` which destructively removes the
+    segment for all processes).
+    """
+
+    __slots__ = ("_name", "_fd", "_mmap", "buf")
+
+    def __init__(self, name: str):
+        import _posixshmem
+
+        self._name = name if name.startswith("/") else "/" + name
+        self.buf = None
+        self._mmap = None
+        self._fd = -1
+        # Diagnostic: check existence before shm_open
+        bare = name.lstrip("/")
+        devshm = f"/dev/shm/{bare}"
+        if not os.path.exists(devshm):
+            existing = [f for f in os.listdir("/dev/shm") if f.startswith("psm_")]
+            raise FileNotFoundError(
+                f"SHM {self._name} not in /dev/shm (pid={os.getpid()}). "
+                f"Existing psm_ count={len(existing)}: {existing[:5]}"
+            )
+        self._fd = _posixshmem.shm_open(self._name, os.O_RDWR, 0o600)
+        try:
+            self._mmap = mmap.mmap(self._fd, os.fstat(self._fd).st_size)
+        except OSError:
+            os.close(self._fd)
+            self._fd = -1
+            raise
+        self.buf = memoryview(self._mmap)
+
+    def close(self):
+        if self.buf is not None:
+            self.buf.release()
+            self.buf = None
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def unlink(self):
+        import _posixshmem
+
+        _posixshmem.shm_unlink(self._name)
+
+    def __del__(self):
+        self.close()
+
+
+def _open_shm_readonly(name: str) -> _ShmHandle:
+    return _ShmHandle(name)
+
+
 class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
@@ -1546,6 +1608,13 @@ class ShmPointerMMData:
             shm.unlink()
             raise
         self.shm_name = shm.name
+        # Diagnostic: verify segment exists after creation
+        bare = shm.name.lstrip("/")
+        devshm = f"/dev/shm/{bare}"
+        logger.info(
+            f"SHM created: {shm.name}, exists={os.path.exists(devshm)}, "
+            f"pid={os.getpid()}, size={nbytes}"
+        )
         shm.close()
         self._shm_handle = None
 
@@ -1561,7 +1630,10 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.shm = None
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+        # Open SHM without using SharedMemory(create=False) because its
+        # error path (except OSError: self.unlink()) destructively removes
+        # the segment on mmap failure, breaking other ranks.
+        self._shm_handle = _open_shm_readonly(self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
             self.shape

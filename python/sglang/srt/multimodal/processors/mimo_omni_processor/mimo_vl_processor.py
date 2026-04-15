@@ -46,80 +46,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-class TorchCodecVideoReader:
-    """Wrapper around torchcodec VideoDecoder with a decord-like interface."""
-
-    _PARALLEL_FRAME_THRESHOLD = int(os.environ.get("SGLANG_VIDEO_DECODE_THRESHOLD", "8"))
-    _thread_pool = ThreadPoolExecutor(max_workers=min(_PARALLEL_FRAME_THRESHOLD, os.cpu_count()))
-
-    def __init__(self, source):
-        from torchcodec.decoders import VideoDecoder
-
-        self._source = source
-        self._decoder = VideoDecoder(source, seek_mode="approximate")
-        self._metadata = self._decoder.metadata
-
-    def __len__(self):
-        return self._metadata.num_frames
-
-    def get_avg_fps(self):
-        return self._metadata.average_fps
-
-    @property
-    def height(self):
-        return self._metadata.height
-
-    @property
-    def width(self):
-        return self._metadata.width
-
-    def get_batch(self, indices):
-        from torchcodec.decoders import VideoDecoder
-
-        indices = list(indices)
-        if len(indices) == 0:
-            return torch.empty(0, 3, self.height, self.width)
-
-        pool = self._thread_pool
-        chunk_size = max(1, len(indices) // pool._max_workers)
-        chunks = [
-            indices[i : i + chunk_size]
-            for i in range(0, len(indices), chunk_size)
-        ]
-        source = self._source
-
-        def _decode_chunk(chunk):
-            d = VideoDecoder(source, seek_mode="approximate")
-            return d.get_frames_at(chunk).data  # (N, C, H, W) uint8
-
-        futures = [pool.submit(_decode_chunk, chunk) for chunk in chunks]
-        parts = [f.result() for f in futures]
-        return torch.cat(parts, dim=0).float()  # (N, C, H, W)
-
-
-def _load_video_torchcodec(video_file):
-    """Load video using torchcodec. Supports file path, URL, base64, and bytes."""
-    if isinstance(video_file, bytes):
-        source = video_file
-    elif isinstance(video_file, str):
-        if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(video_file, timeout=timeout)
-            response.raise_for_status()
-            source = response.content
-        elif video_file.startswith("data:"):
-            _, encoded = video_file.split(",", 1)
-            source = pybase64.b64decode(encoded, validate=True)
-        elif os.path.isfile(video_file):
-            source = video_file
-        else:
-            source = pybase64.b64decode(video_file, validate=True)
-    else:
-        raise ValueError(f"Unsupported video input type: {type(video_file)}")
-
-    return TorchCodecVideoReader(source)
-
 from transformers import Qwen2TokenizerFast
 class MiMoVLProcessor:
     def __init__(
@@ -512,22 +438,6 @@ class MiMoVLProcessor:
 
     def process_video(self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None):
 
-        def smart_nframes(fps_ori, total_frames_ori, frame_factor, num_frames=None, fps=None, max_frames=None, min_frames=None, **kwargs):
-            if num_frames is not None:
-                nframes = num_frames
-            elif fps is not None:
-                nframes = math.ceil(len(vr) / fps_ori * fps)
-                if max_frames is not None:
-                    nframes = min(nframes, max_frames)
-                if min_frames is not None:
-                    nframes = max(nframes, min_frames)
-            if nframes > total_frames_ori:
-                nframes = total_frames_ori
-            nframes = math.ceil(nframes / frame_factor) * frame_factor
-            if nframes == 0:
-                nframes = frame_factor
-            return nframes
-
         def smart_resize_video(num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs):
             max_pixels_per_frame = total_max_pixels * self.temporal_patch_size * self.temporal_compression_ratio // num_total_frames
             max_pixels = max(min_pixels, min(max_pixels_per_frame, max_pixels))
@@ -583,96 +493,44 @@ class MiMoVLProcessor:
         kwargs = self.prepare_video_kwargs(video_input)
         video = video_input.video
 
-        # TODO: currently always sample a multiple of frame_factor frames, so no padding is needed
-        frame_factor = self.temporal_patch_size * self.temporal_compression_ratio
+        if not isinstance(video, tuple):
+            raise ValueError(
+                f"video must be a tuple of (video_tensor, timestamps), but got {type(video)}. "
+                "Video download and decoding should be done by sglang load_video before calling process_video."
+            )
 
-        if isinstance(video, (str, bytes)):
-            vr = _load_video_torchcodec(video)
-
-            fps_ori = vr.get_avg_fps()
-            total_frames_ori = len(vr)
-            duration_ori = total_frames_ori / fps_ori
-
-            start_time = video_input.start_time if video_input.start_time is not None else 0
-            end_time = video_input.end_time if video_input.end_time is not None else duration_ori
-            duration_seg = end_time - start_time
-            total_frames_seg = duration_seg * fps_ori
-
-            if video_input.segment_type == "individual":
-                num_frames_sampled = smart_nframes(fps_ori, total_frames_seg, frame_factor=frame_factor, **kwargs)
-                fps_sampled = num_frames_sampled / duration_seg
-                start_frame_idx, end_frame_idx = int(start_time * fps_ori), int(end_time * fps_ori)
-            else:
-                num_frames_sampled = smart_nframes(fps_ori, total_frames_ori, frame_factor=frame_factor, **kwargs)
-                fps_sampled = num_frames_sampled / duration_ori
-                start_frame_idx, end_frame_idx = 0, len(vr)
-
-            if video_input.do_include_last_frame:
-                frame_idx_sampled = torch.linspace(start_frame_idx, end_frame_idx - 1, num_frames_sampled).round().int()
-            else:
-                frame_idx_sampled = torch.linspace(start_frame_idx, end_frame_idx, num_frames_sampled + 1).round().int()[:-1]
-            frame_idx_sampled = frame_idx_sampled.clamp(max=len(vr)-1)
-            timestamps_sampled = frame_idx_sampled / fps_ori
-
-            if video_input.segment_type == "individual":
-                frame_idx_seg = frame_idx_sampled
-                timestamps_seg = timestamps_sampled
-                num_frames_seg = num_frames_sampled
-                start_time_seg = start_time
-                end_time_seg = end_time
-            else:
-                # Use segment_frame_selector to select frames aligned to frame_factor
-                frame_idx_seg = segment_frame_selector(timestamps_sampled, start_time, end_time)
-
-                timestamps_seg = timestamps_sampled[frame_idx_seg]
-                num_frames_seg = len(timestamps_seg)
-                start_time_seg = timestamps_seg[0].item()
-                end_time_seg = timestamps_seg[-1].item() + (1 / fps_sampled)
-
-            assert num_frames_seg == len(frame_idx_seg)
-            assert num_frames_seg == timestamps_seg.shape[0]
-
-            frames = vr.get_batch(frame_idx_seg.tolist())  # (N, C, H, W) float
-
-            video_meta = {
-                "fps_sampled": fps_sampled,
-                "segment_start_time": start_time_seg,
-                "segment_end_time": end_time_seg,
-            }
-
+        video_tensor, timestamps_sampled = video
+        if len(timestamps_sampled) < 2:
+            logger.info("[Warning] Less than two frames are sampled, using default fps (1 fps)")
+            fps_sampled = 1
         else:
-            video_tensor, timestamps_sampled = video
-            if len(timestamps_sampled) < 2:
-                logger.info("[Warning] Less than two frames are sampled, using default fps (1 fps)")
-                fps_sampled = 1
-            else:
-                fps_sampled = 1 / (timestamps_sampled[1] - timestamps_sampled[0])
-            num_frames_sampled = video_tensor.shape[0]
+            fps_sampled = 1 / (timestamps_sampled[1] - timestamps_sampled[0])
+        num_frames_sampled = video_tensor.shape[0]
 
-            start_time = video_input.start_time if video_input.start_time is not None else timestamps_sampled[0]
-            end_time = video_input.end_time if video_input.end_time is not None else timestamps_sampled[-1] + (1 / fps_sampled)
+        start_time = video_input.start_time if video_input.start_time is not None else timestamps_sampled[0]
+        end_time = video_input.end_time if video_input.end_time is not None else timestamps_sampled[-1] + (1 / fps_sampled)
 
-            if video_input.segment_type == "individual":
-                start_time_seg = start_time
-                end_time_seg = end_time
-                timestamps_seg = timestamps_sampled
-                frames = video_tensor
-                num_frames_seg = num_frames_sampled
-            else:
-                # Use segment_frame_selector to select frames
-                selected_indices = segment_frame_selector(timestamps_sampled, start_time, end_time)
+        if video_input.segment_type == "individual":
+            start_time_seg = start_time
+            end_time_seg = end_time
+            timestamps_seg = timestamps_sampled
+            frames = video_tensor
+            num_frames_seg = num_frames_sampled
+        else:
+            # Use segment_frame_selector to select frames
+            selected_indices = segment_frame_selector(timestamps_sampled, start_time, end_time)
 
-                timestamps_seg = timestamps_sampled[selected_indices]
-                frames = video_tensor[selected_indices]
-                num_frames_seg = len(timestamps_seg)
-                start_time_seg = timestamps_seg[0].item() if isinstance(timestamps_seg[0], torch.Tensor) else timestamps_seg[0]
-                end_time_seg = (timestamps_seg[-1].item() if isinstance(timestamps_seg[-1], torch.Tensor) else timestamps_seg[-1]) + (1 / fps_sampled).item()
+            timestamps_seg = timestamps_sampled[selected_indices]
+            frames = video_tensor[selected_indices]
+            num_frames_seg = len(timestamps_seg)
+            start_time_seg = timestamps_seg[0].item() if isinstance(timestamps_seg[0], torch.Tensor) else timestamps_seg[0]
+            end_time_seg = (timestamps_seg[-1].item() if isinstance(timestamps_seg[-1], torch.Tensor) else timestamps_seg[-1]) + (1 / fps_sampled).item()
 
-            video_meta = {
-                "fps_sampled": fps_sampled,
-                "segment_start_time": start_time_seg,
-                "segment_end_time": end_time_seg,
-            }
+        video_meta = {
+            "fps_sampled": fps_sampled,
+            "segment_start_time": start_time_seg,
+            "segment_end_time": end_time_seg,
+        }
 
         min_pixels, max_pixels = smart_resize_video(num_frames_sampled, **kwargs)
 

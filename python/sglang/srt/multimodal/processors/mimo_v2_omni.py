@@ -554,32 +554,29 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
 
         return result
 
-    def _preprocess_video_sync(self, video, preprocess_kwargs=None):
-        """Decode and sample video frames. Resize is done by mimo_omni_processor."""
-        from sglang.srt.utils.common import load_video_torchcodec
+    def _preprocess_video_sync(self, vdw, preprocess_kwargs=None):
+        """Sample frames from a pre-loaded VideoDecoderWrapper.
 
-        vr = load_video_torchcodec(video)
+        Returns (video_tensor, timestamps) tuple suitable for VideoInput.
+        video_tensor: TCHW float Tensor
+        timestamps: 1D float Tensor of per-frame timestamps in seconds
+        """
         ele = preprocess_kwargs or {}
-        total_frames, video_fps = len(vr), vr.get_avg_fps()
+        total_frames, video_fps = len(vdw), vdw.avg_fps
         nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
         idx = list(
             np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64))
         )
         try:
-            video_tensor = vr.get_batch(idx)  # (N, C, H, W)
+            video_tensor = vdw.get_frames_as_tensor(idx)  # NHWC uint8 Tensor
         except Exception as e:
             logger.error(f"Video decode failed in _preprocess_video_sync: {e}")
             raise HTTPException(
                 status_code=432, detail="Video file is corrupted or cannot be decoded"
             )
-        video_metadata = {
-            "fps": video_fps,
-            "duration": total_frames / video_fps,
-            "total_num_frames": total_frames,
-            "frames_indices": idx,
-            "video_backend": "torchcodec",
-        }
-        return video_tensor, video_metadata
+        video_tensor = video_tensor.permute(0, 3, 1, 2).float()  # NHWC → TCHW float
+        timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
+        return (video_tensor, timestamps)
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -918,6 +915,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         raw_audio_data = audio_data or []
 
         loaded_image_iter = iter(base_output.images)
+        loaded_video_iter = iter(base_output.videos)
         loaded_audio_iter = iter(base_output.audios)
 
         raw_image_iter = iter(raw_image_data)
@@ -954,11 +952,11 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                         )
                     )
                 elif modality == Modality.VIDEO:
+                    loaded_video = next(loaded_video_iter)
                     raw_video_item = next(raw_video_iter)
 
                     preprocess_kwargs = {}
                     raw_video_item_audio = None
-                    raw_video_source = raw_video_item
                     use_audio = False
                     if isinstance(raw_video_item, VideoData):
                         preprocess_kwargs = (
@@ -966,23 +964,26 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                         )
                         use_audio = has_audio_track(raw_video_item.url)
                         raw_video_item_audio = raw_video_item.url
-                        raw_video_source = raw_video_item.url
                     elif isinstance(raw_video_item, dict):
                         use_audio = has_audio_track(
                             raw_video_item.get("url", raw_video_item)
                         )
                         raw_video_item_audio = raw_video_item
-                        raw_video_source = raw_video_item.get("url", raw_video_item)
                     elif isinstance(raw_video_item, str):
                         use_audio = has_audio_track(raw_video_item)
                         raw_video_item_audio = raw_video_item
+
+                    # Pre-process video: VideoDecoderWrapper → (TCHW tensor, timestamps) tuple
+                    video_tuple = self._preprocess_video_sync(
+                        loaded_video, preprocess_kwargs
+                    )
 
                     if use_audio:
                         contents.append(
                             Content(
                                 type="video_audio",
                                 content=VideoAudioInput(
-                                    video=raw_video_source,
+                                    video=video_tuple,
                                     audio=raw_video_item_audio,
                                     min_pixels=preprocess_kwargs.get(
                                         "min_pixels", None
@@ -1011,7 +1012,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                             Content(
                                 type="video",
                                 content=VideoInput(
-                                    video=raw_video_source,
+                                    video=video_tuple,
                                     min_pixels=preprocess_kwargs.get(
                                         "min_pixels", None
                                     ),
