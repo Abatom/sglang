@@ -40,7 +40,7 @@ from sglang.srt.models.mimo_audio import MimoAudioEncoder, MimoAudioEncoderConfi
 from sglang.srt.models.mimo_v2_flash import (
     MiMoV2FlashForCausalLM,
 )
-from sglang.srt.models.mimo_vit import Mimo_VisionTransformer, Mimo_VLVisionConfig
+from sglang.srt.models.mimo_vl import Mimo_VisionTransformer, Mimo_VLVisionConfig
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
