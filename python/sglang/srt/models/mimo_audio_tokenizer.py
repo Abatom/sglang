@@ -16,10 +16,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
-_is_cuda = is_cuda()
-
-if not _is_cuda:
-    raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+assert is_cuda(), "MiMoAudioTokenizer requires CUDA to run."
 
 from sgl_kernel.flash_attn import flash_attn_varlen_func
 
