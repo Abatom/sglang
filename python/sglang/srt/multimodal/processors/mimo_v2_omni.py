@@ -8,14 +8,13 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Union
 
 import numpy as np
 import pybase64
@@ -24,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -60,13 +58,9 @@ except ImportError:
     torchaudio = None
     MelSpectrogram = None
 
-# ---------------------------------------------------------------------------
-# Protocol data classes
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ImageInput:
-    image: Image.Image | str | bytes | torch.Tensor     # pixels (C, H, W)
+    image: Image.Image | str | bytes | torch.Tensor
     max_pixels: Optional[int] = None
     min_pixels: Optional[int] = None
 
@@ -76,8 +70,7 @@ class ImageInput:
 
 @dataclass
 class VideoInput:
-    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]           # pixels (T, C, H, W), timestamps (T)
-    # video preprocessor arguments
+    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     total_max_pixels: Optional[int] = None
@@ -86,11 +79,9 @@ class VideoInput:
     max_frames: Optional[int] = None
     min_frames: Optional[int] = None
     do_include_last_frame: Optional[bool] = False
-    # segment arguments
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     segment_type: Literal["individual", "partial"] = "individual"
-    
 
     def __post_init__(self):
         if not isinstance(self.video, (VideoReader, str, bytes, tuple)):
@@ -104,7 +95,7 @@ class VideoInput:
                 raise ValueError(f"video must be a tuple of (pixels-TCHW, timestamps-T), but got {self.video[0].shape} and {self.video[1].shape}")
         assert self.segment_type in ["individual", "partial"]
         assert self.segment_type == "partial" or (self.start_time is None and self.end_time is None)
-            
+
 
 @dataclass
 class AudioInput:
@@ -132,9 +123,8 @@ class AudioInput:
 
 @dataclass
 class VideoAudioInput:
-    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]           # pixels (T, C, H, W), timestamps (T)
+    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]
     audio: str | bytes | torch.Tensor
-    # video preprocessor arguments
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     total_max_pixels: Optional[int] = None
@@ -143,7 +133,6 @@ class VideoAudioInput:
     max_frames: Optional[int] = None
     min_frames: Optional[int] = None
     do_include_last_frame: Optional[bool] = False
-    # segment arguments
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     segment_type: Literal["individual", "partial"] = "individual"
@@ -173,11 +162,11 @@ TextInput = str | list[int]
 class MiMoVLInputSample:
     input_ids: torch.Tensor
     labels: Optional[torch.Tensor]
-    pixel_values: list[torch.Tensor]                # list of (num_patches, patch_dim)
-    pixel_values_videos: list[torch.Tensor]         # list of (num_patches, patch_dim)
-    image_thw_grids: list[torch.Tensor]             # list of (3)
-    video_thw_grids: list[torch.Tensor]             # list of (3)
-    audio_inputs: list[torch.Tensor]                # list of (T_padded//group_size, group_size, n_vq) for audio_input_ids; list of (n_mels, seq_len) for audio_spec
+    pixel_values: list[torch.Tensor]
+    pixel_values_videos: list[torch.Tensor]
+    image_thw_grids: list[torch.Tensor]
+    video_thw_grids: list[torch.Tensor]
+    audio_inputs: list[torch.Tensor]
     position_ids: Optional[torch.Tensor] = None
     rope_deltas: Optional[torch.Tensor] = None
     extra: dict = field(default_factory=dict)
@@ -207,186 +196,9 @@ class Content:
             if not isinstance(self.content, VideoAudioInput):
                 raise ValueError(f"content must be a VideoAudioInput, but got {type(self.content)}")
 
-@dataclass
-class MessageTurn:
-    role: Literal["user", "assistant", "system"]
-    contents: list[Content]
-
-Conversation = list[MessageTurn]
-
-
-# ---------------------------------------------------------------------------
-# RoPE utilities
-# ---------------------------------------------------------------------------
-
-def get_rope_index(
-    spatial_merge_size: int,
-    image_token_id: int,
-    video_token_id: int,
-    vision_start_token_id: int,
-    model_type: str,
-    tokens_per_second: Optional[int] = None,
-    input_ids: Optional[torch.LongTensor] = None,
-    image_grid_thw: Optional[torch.LongTensor] = None,
-    video_grid_thw: Optional[torch.LongTensor] = None,
-    second_per_grid_ts: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    mrope_position_deltas = []
-    if input_ids is not None and (
-        image_grid_thw is not None or video_grid_thw is not None
-    ):
-        total_input_ids = input_ids
-        position_ids = torch.ones(
-            3,
-            input_ids.shape[0],
-            input_ids.shape[1],
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        image_index, video_index = 0, 0
-        for i, input_ids in enumerate(total_input_ids):
-            image_nums, video_nums = 0, 0
-            vision_start_indices = torch.argwhere(
-                input_ids == vision_start_token_id
-            ).squeeze(1)
-            vision_tokens = input_ids[vision_start_indices + 1]
-            image_nums = (vision_tokens == image_token_id).sum()
-            video_nums = (vision_tokens == video_token_id).sum()
-            input_tokens = input_ids.tolist()
-            llm_pos_ids_list: list = []
-            st = 0
-            remain_images, remain_videos = image_nums, video_nums
-            for _ in range(image_nums + video_nums):
-                if image_token_id in input_tokens and remain_images > 0:
-                    ed_image = input_tokens.index(image_token_id, st)
-                else:
-                    ed_image = len(input_tokens) + 1
-                if video_token_id in input_tokens and remain_videos > 0:
-                    ed_video = input_tokens.index(video_token_id, st)
-                else:
-                    ed_video = len(input_tokens) + 1
-                if ed_image < ed_video:
-                    t, h, w = (
-                        image_grid_thw[image_index][0],
-                        image_grid_thw[image_index][1],
-                        image_grid_thw[image_index][2],
-                    )
-                    second_per_grid_t = 0
-                    image_index += 1
-                    remain_images -= 1
-                    ed = ed_image
-                else:
-                    t, h, w = (
-                        video_grid_thw[video_index][0],
-                        video_grid_thw[video_index][1],
-                        video_grid_thw[video_index][2],
-                    )
-                    if second_per_grid_ts is not None:
-                        second_per_grid_t = second_per_grid_ts[video_index]
-                    else:
-                        second_per_grid_t = 1.0
-                    video_index += 1
-                    remain_videos -= 1
-                    ed = ed_video
-                llm_grid_t, llm_grid_h, llm_grid_w = (
-                    t.item(),
-                    h.item() // spatial_merge_size,
-                    w.item() // spatial_merge_size,
-                )
-                text_len = ed - st
-
-                st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
-                )
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                )
-
-                if model_type == "qwen2_5_vl":
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(
-                        -1, llm_grid_h * llm_grid_w
-                    )
-
-                    time_tensor = (
-                        expanded_range * second_per_grid_t * tokens_per_second
-                    )
-
-                    time_tensor_long = time_tensor.long()
-                    t_index = time_tensor_long.flatten()
-                elif model_type == "qwen2_vl":
-                    t_index = (
-                        torch.arange(llm_grid_t)
-                        .view(-1, 1)
-                        .expand(-1, llm_grid_h * llm_grid_w)
-                        .flatten()
-                    )
-                else:
-                    raise RuntimeError("Unimplemented")
-                h_index = (
-                    torch.arange(llm_grid_h)
-                    .view(1, -1, 1)
-                    .expand(llm_grid_t, -1, llm_grid_w)
-                    .flatten()
-                )
-                w_index = (
-                    torch.arange(llm_grid_w)
-                    .view(1, 1, -1)
-                    .expand(llm_grid_t, llm_grid_h, -1)
-                    .flatten()
-                )
-                llm_pos_ids_list.append(
-                    torch.stack([t_index, h_index, w_index]) + text_len + st_idx
-                )
-                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-            if st < len(input_tokens):
-                st_idx = (
-                    llm_pos_ids_list[-1].max() + 1
-                    if len(llm_pos_ids_list) > 0
-                    else 0
-                )
-                text_len = len(input_tokens) - st
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                )
-
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-            position_ids[..., i, :] = llm_positions.to(position_ids.device)
-            mrope_position_deltas.append(
-                llm_positions.max() + 1 - len(total_input_ids[i])
-            )
-        mrope_position_deltas = torch.tensor(
-            mrope_position_deltas, device=input_ids.device
-        ).unsqueeze(1)
-        return position_ids, mrope_position_deltas
-    else:
-        s = input_ids.shape[1]
-        position_ids = torch.arange(s)
-        position_ids = (
-            position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
-        )
-        max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-            -1, keepdim=True
-        )[0]
-        mrope_position_deltas = max_position_ids + 1 - s
-        return position_ids, mrope_position_deltas
-
-
-# ---------------------------------------------------------------------------
-# VL utilities
-# ---------------------------------------------------------------------------
-
-MIMO_PLACEHOLDER = "<|mimo_placeholder|>"
-
-# Imagenet's mean and std, reshaped for broadcasting.
 QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
 QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
 
-# Device-aware cache for mean/std tensors
 _mean_std_cache = {}
 
 
@@ -406,12 +218,11 @@ def smart_resize(
     3. The aspect ratio of the image is maintained as closely as possible.
     """
     if min(height, width) < factor:
-        # Keep aspect ratio and resize smaller edge to factor
         if height < width:
             height = factor
             width = int(width * (factor / height))
         else:
-            width = factor 
+            width = factor
             height = int(height * (factor / width))
     elif max(height, width) / min(height, width) > 200:
         raise ValueError(
@@ -433,22 +244,13 @@ def smart_resize(
 def to_rgb(pil_image: Image.Image) -> Image.Image:
     if pil_image.mode == 'RGBA':
         white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
-        white_background.paste(pil_image, mask=pil_image.split()[3])  # Use alpha channel as mask
+        white_background.paste(pil_image, mask=pil_image.split()[3])
         return white_background
     else:
         return pil_image.convert("RGB")
 
 
 def standardize_batch(images: torch.Tensor) -> torch.Tensor:
-    """
-    Standardize a batch of images using device-aware mean/std.
-    
-    Args:
-        images: Tensor of shape (B, C, H, W) in range [0, 255]
-    
-    Returns:
-        Standardized tensor of shape (B, C, H, W)
-    """
     device_key = str(images.device)
     if device_key not in _mean_std_cache:
         _mean_std_cache[device_key] = (
@@ -458,88 +260,62 @@ def standardize_batch(images: torch.Tensor) -> torch.Tensor:
     mean, std = _mean_std_cache[device_key]
     return (images - mean) / std
 
+
 def get_visual_transform_batch(
-    frames: torch.Tensor,  # (t, c, h, w)
+    frames: torch.Tensor,
     factor: int,
     min_pixels: int,
     max_pixels: int,
     device: Optional[torch.device] = None,
 ):
-    """
-    Batch version of get_visual_transform.
-    
-    Note: 
-    - Input frames should be in range [0, 255] (uint8 or float)
-    - standardize_image expects PIL image (H,W,C) in [0,255], converts to numpy array,
-      then to tensor, then (img - mean) / std (WITHOUT dividing by 255 first!)
-    - So we need to match that: resize, then (img - mean) / std directly
-    """
     if device is not None:
         frames = frames.to(device)
-    
-    t, c, h, w = frames.shape
-    
-    # Compute target size ONCE
+
+    _, _, h, w = frames.shape
     h_bar, w_bar = smart_resize(h, w, factor, min_pixels, max_pixels)
-    
-    # Batch resize — no loop, no PIL
-    # Convert to float for interpolation
+
     resized = F.interpolate(
         frames.float(),
         size=(h_bar, w_bar),
         mode='bilinear',
         align_corners=False,
     )
-    
-    # Batch standardization using device-aware mean/std
     standardized = standardize_batch(resized)
-    
+
     return standardized, w_bar, h_bar
 
+
 def get_visual_transform(
-        img: torch.Tensor | Image.Image, 
-        factor: int, 
-        min_pixels: int, 
+        img: torch.Tensor | Image.Image,
+        factor: int,
+        min_pixels: int,
         max_pixels: int,
         device: Optional[torch.device] = None,
     ):
-    """
-    Transform and resize image using PyTorch's F.interpolate with bilinear mode.
-    This ensures consistency with get_visual_transform_batch.
-    """
-    # Convert to torch tensor if needed
     if isinstance(img, torch.Tensor):
-        # Input: (C, H, W) in range [0, 255]
         img_tensor = img.float()
-        c, h, w = img_tensor.shape
+        _, h, w = img_tensor.shape
     elif isinstance(img, Image.Image):
-        # PIL Image
         img = img.convert("RGB")
         w, h = img.size
-        # Convert PIL to tensor: (H, W, C) -> (C, H, W)
-        img_array = np.array(img)  # (H, W, C), [0, 255]
-        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()  # (C, H, W)
-        c = 3
+        img_array = np.array(img)
+        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
     else:
         raise TypeError(f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image")
-    
+
     if device is not None:
         img_tensor = img_tensor.to(device)
-    
-    # Compute target size
+
     h_bar, w_bar = smart_resize(h, w, factor, min_pixels, max_pixels)
-    
-    # Resize using F.interpolate with bilinear (same as batch version)
+
     img_resized = F.interpolate(
-        img_tensor.unsqueeze(0),  # Add batch dim
+        img_tensor.unsqueeze(0),
         size=(h_bar, w_bar),
         mode='bilinear',
         align_corners=False,
     )
-    
-    # Standardize: (img - mean) / std
-    img_standardized = standardize_batch(img_resized).squeeze(0)  # (C, H, W)
-    
+    img_standardized = standardize_batch(img_resized).squeeze(0)
+
     return img_standardized, w_bar, h_bar
 
 
@@ -551,7 +327,6 @@ def fetch_image(
         image_obj = image
     elif isinstance(image, str):
         if image.startswith("http://") or image.startswith("https://"):
-            # fix memory leak issue while using BytesIO
             with requests.get(image, stream=True) as response:
                 response.raise_for_status()
                 with BytesIO(response.content) as bio:
@@ -562,23 +337,17 @@ def fetch_image(
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
-                # fix memory leak issue while using BytesIO
                 with BytesIO(data) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
         else:
             image_obj = Image.open(image)
     else:
-        # bytes
         image_obj = Image.open(BytesIO(image))
     if image_obj is None:
         raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
     image = to_rgb(image_obj)
     return image
 
-
-# ---------------------------------------------------------------------------
-# MiMoVLProcessor
-# ---------------------------------------------------------------------------
 
 class MiMoVLProcessor:
     def __init__(
@@ -637,14 +406,13 @@ class MiMoVLProcessor:
             rope_type="rope",
 
             video_process_num_threads=16,
-            
             device=None,
 
             **kwargs
         ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
-        
+
         if device is None:
             self.device = None
         else:
@@ -659,7 +427,7 @@ class MiMoVLProcessor:
         assert self.use_video_timestamps
         assert not self.use_video_timestamps or self.rope_type == "rope", "use_video_timestamps only supports 1d rope"
         self.video_audio_interleave_length = video_audio_interleave_length
-        self.use_per_grid_t_timestamps = False #use_per_grid_t_timestamps
+        self.use_per_grid_t_timestamps = False
         assert self.video_audio_interleave_length == -1 or self.rope_type == "rope", "video_audio_interleave_length != -1 only supports 1d rope"
         assert self.video_audio_interleave_length == -1 or self.video_audio_interleave_length >= 0
 
@@ -695,7 +463,6 @@ class MiMoVLProcessor:
         self.audio_stride_size = audio_stride_size
         self.audio_avg_pooler = audio_avg_pooler
 
-        # load mel spectrogram lazily, otherwise it might hang in mimo-omni-dataloader
         self.mel_spectrogram_kwargs = dict(
             sample_rate=audio_sampling_rate,
             n_fft=audio_nfft,
@@ -749,88 +516,8 @@ class MiMoVLProcessor:
         }
 
         self.http_session = requests.Session()
-        for k, v in kwargs.items():
+        for k in kwargs:
             logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoVLProcessor")
-
-    def get_config(self):
-        return {
-            "patch_size": self.patch_size,
-            "merge_size": self.merge_size,
-            "temporal_patch_size": self.temporal_patch_size,
-            "temporal_compression_ratio": self.temporal_compression_ratio,
-            "video_tokens_per_second": self.video_tokens_per_second,
-            "use_video_timestamps": self.use_video_timestamps,
-            "video_audio_interleave_length": self.video_audio_interleave_length,
-            "use_per_grid_t_timestamps": self.use_per_grid_t_timestamps,
-            "audio_kernel_size": self.audio_kernel_size,
-            "audio_stride_size": self.audio_stride_size,
-            "audio_avg_pooler": self.audio_avg_pooler,
-            "audio_sampling_rate": self.audio_sampling_rate,
-            "audio_nfft": self.audio_nfft,
-            "audio_hop_length": self.audio_hop_length,
-            "audio_window_size": self.audio_window_size,
-            "audio_fmin": self.audio_fmin,
-            "audio_fmax": self.audio_fmax,
-            "audio_n_mels": self.audio_n_mels,
-            "audio_segment_size": self.audio_segment_size,
-            "audio_channels": self.audio_channels,
-            "audio_group_size": self.audio_group_size,
-            "audio_input_id_per_second": self.audio_input_id_per_second,
-            "audio_zeroemb_idx": self.audio_zeroemb_idxs.tolist(),
-            "image_min_pixels": self.default_image_processor_kwargs["min_pixels"],
-            "image_max_pixels": self.default_image_processor_kwargs["max_pixels"],
-            "video_min_pixels": self.default_video_processor_kwargs["min_pixels"],
-            "video_max_pixels": self.default_video_processor_kwargs["max_pixels"],
-            "video_total_max_pixels": self.default_video_processor_kwargs["total_max_pixels"],
-            "fps": self.default_video_processor_kwargs["fps"],
-            "num_frames": self.default_video_processor_kwargs["num_frames"],
-            "max_frames": self.default_video_processor_kwargs["max_frames"],
-            "min_frames": self.default_video_processor_kwargs["min_frames"],
-            "image_token_id": self.image_token_id,
-            "video_token_id": self.video_token_id,
-            "audio_token_id": self.audio_token_id,
-            "vision_start_token_id": self.vision_start_token_id,
-            "vision_end_token_id": self.vision_end_token_id,
-            "audio_start_token_id": self.audio_start_token_id,
-            "audio_end_token_id": self.audio_end_token_id,
-            "video_start_token_id": self.video_start_token_id,
-            "video_end_token_id": self.video_end_token_id,
-            "pad_token_id": self.pad_token_id,
-            "rope_type": self.rope_type,
-            "video_process_num_threads": self.video_process_num_threads,
-        }
-
-    def copy_codebase(self, path: str):
-        src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-        dst_path = os.path.join(path, "mimo_vl_processor")
-        if os.path.exists(src_path):
-            if not os.path.exists(dst_path):
-                shutil.copytree(src_path, dst_path)
-                logger.info(f"Successfully copied mimo_vl_processor to {dst_path}")
-            else:
-                logger.info(f"mimo_vl_processor codebase already exists at {dst_path}, skip copying")
-        else:
-            logger.info(f"mimo_vl_processor codebase not found at {src_path}, skip copying")
-            raise FileNotFoundError(f"mimo_vl_processor codebase not found at {src_path}")
-
-    def save_config(self, path: str):
-        config = self.get_config()
-        with open(path, "w") as f:
-            json.dump(config, f, indent=4)
-
-    @classmethod
-    def load_from_config(cls, path: str | dict, **kwargs):
-        if isinstance(path, str):
-            if os.path.isdir(path):
-                path = os.path.join(path, "mimo_processor_config.json")
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Processor config file not found at {path}")
-            with open(path, "r") as f:
-                config = json.load(f)
-        else:
-            config = path
-        config.update(kwargs)
-        return cls(**config)
 
     @property
     def mel_spectrogram(self):
@@ -854,7 +541,6 @@ class MiMoVLProcessor:
                 kwargs[k] = getattr(video, k)
             else:
                 kwargs[k] = self.default_video_processor_kwargs[k]
-        # Priority: num_frames -> fps + max/min_frames -> default_num_frames -> default_fps + default_max/min_frames
         if video.num_frames is not None:
             kwargs["num_frames"] = video.num_frames
         elif video.fps is not None:
@@ -924,8 +610,8 @@ class MiMoVLProcessor:
                 raise ValueError(
                     f"Invalid audio format: source={audio_source}, detail={e}"
                 ) from e
-            waveform = samples.data  # torch.Tensor
-            original_sr = samples.sample_rate  # int
+            waveform = samples.data
+            original_sr = samples.sample_rate
 
         if original_sr != self.audio_sampling_rate:
             if original_sr in self._resamplers:
@@ -938,36 +624,31 @@ class MiMoVLProcessor:
                 )
             waveform = self._resamplers[original_sr](waveform)
         if waveform.ndim == 2:
-            waveform = waveform.mean(dim=0)                     # (wav_len,)
-        spec = self.mel_spectrogram(waveform[None, :])          # (1, n_mels, seq_len)
-        spec = torch.log(torch.clip(spec, min=1e-7)).squeeze()  # (n_mels, seq_len)
-        spec = spec.transpose(0, 1)                             # (seq_len, n_mels)
+            waveform = waveform.mean(dim=0)
+        spec = self.mel_spectrogram(waveform[None, :])
+        spec = torch.log(torch.clip(spec, min=1e-7)).squeeze()
+        spec = spec.transpose(0, 1)
 
         audio_token_len = spec.shape[0] + 3 - self.audio_kernel_size
         audio_token_len = (audio_token_len + 2 - self.audio_kernel_size) // self.audio_stride_size + 1
-        audio_token_len = audio_token_len // self.audio_avg_pooler + int(audio_token_len % self.audio_avg_pooler != 0)        # This is the length for input local transformer
-        audio_token_len = math.ceil(audio_token_len / self.audio_group_size)        # This is the length for LM
+        audio_token_len = audio_token_len // self.audio_avg_pooler + int(audio_token_len % self.audio_avg_pooler != 0)
+        audio_token_len = math.ceil(audio_token_len / self.audio_group_size)
 
         return spec, audio_token_len
 
     def process_image(self, image: ImageInput):
-        """
-        - Input: ImageInput
-        - Output: nomrmalized image, torch.Tensor (C, H, W)
-        """
         kwargs = self.prepare_image_kwargs(image)
         image = image.image
         if isinstance(image, (str, bytes)):
             image = fetch_image(image)
         image_transformed_tensor, _, _ = get_visual_transform(
-            image, 
-            factor=self.patch_size*self.merge_size, 
-            min_pixels=kwargs["min_pixels"], 
+            image,
+            factor=self.patch_size*self.merge_size,
+            min_pixels=kwargs["min_pixels"],
             max_pixels=kwargs["max_pixels"],
             device=self.device,
         )
         return image_transformed_tensor
-
 
     def process_video(self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None):
 
@@ -977,47 +658,21 @@ class MiMoVLProcessor:
             return min_pixels, max_pixels
 
         def segment_frame_selector(all_timestamps, start_time, end_time):
-            """
-            Select frame indices from all_timestamps based on the start_time, end_time
-
-            Principle 1: 左闭右开，纳入所有在区间 [start, end) 内的帧
-                all_timestamps = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-                0-0 --> [0]
-                0-1 --> [0]
-                0-2 --> [0, 1]
-                1-1 --> [1]
-
-            Principle 2: 至少选择一帧，如果一帧都没有，则按照向左选取最近帧
-                all_timestamps = [0, 3, 6, 9, 12, 15]
-                1-1 --> [0]
-                1-3 --> [0]
-                1-4 --> [3]
-                all_timestamps = [0, 1.1, 2.2, 3.3, 4.4, 5.5]
-                1-1 --> [0]
-                1-2 --> [1.1]
-                1.2-2 --> [1.1]
-            """
-            # Convert to tensor if needed
+            """Select frame indices in [start_time, end_time). If none found, pick the nearest frame to the left."""
             if not isinstance(all_timestamps, torch.Tensor):
                 all_timestamps = torch.tensor(all_timestamps)
 
-            # Find all frames in range [start_time, end_time)
             mask = (all_timestamps >= start_time) & (all_timestamps < end_time)
             candidate_indices = torch.where(mask)[0]
 
-            # If no frames found, apply Principle 2: select the closest frame to the left
             if len(candidate_indices) == 0:
-                # Find frames before or at start_time
                 left_mask = all_timestamps <= start_time
                 left_indices = torch.where(left_mask)[0]
                 if len(left_indices) > 0:
-                    # Select the rightmost frame before start_time
                     selected_frame_indices = left_indices[-1:].clone()
                 else:
-                    # No frames before start_time
                     raise ValueError(f"No frames before start_time {start_time} in all_timestamps {all_timestamps.tolist()}")
             else:
-                # Frames found in the range
                 selected_frame_indices = candidate_indices
 
             assert len(selected_frame_indices) > 0, f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
@@ -1050,7 +705,6 @@ class MiMoVLProcessor:
             frames = video_tensor
             num_frames_seg = num_frames_sampled
         else:
-            # Use segment_frame_selector to select frames
             selected_indices = segment_frame_selector(timestamps_sampled, start_time, end_time)
 
             timestamps_seg = timestamps_sampled[selected_indices]
@@ -1069,40 +723,29 @@ class MiMoVLProcessor:
 
         assert num_frames_seg > 0, f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
 
-        # Align num_frames_seg to temporal_padding_factor
         temporal_padding_factor = self.temporal_patch_size * self.temporal_compression_ratio if temporal_padding_factor is None else temporal_padding_factor
 
         if num_frames_seg % temporal_padding_factor == 0:
-            # Already aligned, no need to do anything
             aligned_frames = frames
             aligned_timestamps = timestamps_seg
         else:
-            # Not aligned, replicate last frame until aligned
             aligned_num_frames = ((num_frames_seg + temporal_padding_factor - 1) // temporal_padding_factor) * temporal_padding_factor
             num_frames_needed = aligned_num_frames - num_frames_seg
             aligned_frames = torch.cat([frames, frames[-1:].repeat(num_frames_needed, *[1]*(frames.ndim-1))], dim=0)
             aligned_timestamps = torch.cat([timestamps_seg, timestamps_seg[-1:].repeat(num_frames_needed)], dim=0)
 
-        # Batch视频帧变换（使用PyTorch的F.interpolate进行高效的批量resize）
         video_transformed_tensor, _, _ = get_visual_transform_batch(
             aligned_frames,
             factor=self.patch_size*self.merge_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             device=self.device,
-        )          # (t, c, h, w)
+        )
 
         visual_patches, thw_grid = self._flatten_visual_inputs(video_transformed_tensor, "video")
         return visual_patches, thw_grid, aligned_timestamps, video_meta
 
-
     def process_audio(self, audio: AudioInput):
-        """
-        - Input: AudioInput
-        - Output:
-            - Inference: audio is str/bytes/np.ndarray, return mel_spectrogram and number of tokens
-            - Training: audio is torch.Tensor, return padded_audio
-        """
         audio = audio.audio
         if isinstance(audio, np.ndarray):
             waveform = torch.from_numpy(audio).float()
@@ -1115,130 +758,31 @@ class MiMoVLProcessor:
         T = audio.shape[0]
         audio = audio[:,:self.audio_channels].to(torch.long)
         padded_T = (T + self.audio_group_size - 1) // self.audio_group_size * self.audio_group_size
-        padded_audio = torch.cat([audio, torch.zeros(padded_T - T, self.audio_channels, dtype=torch.long) + audio[-1, :]], dim=0)   # pad using the last embedding
+        padded_audio = torch.cat([audio, torch.zeros(padded_T - T, self.audio_channels, dtype=torch.long) + audio[-1, :]], dim=0)
         padded_audio = padded_audio.reshape(padded_T // self.audio_group_size, self.audio_group_size, self.audio_channels)
         return padded_audio
 
-    def convert_conversation_to_contents(
-        self,
-        conversation: Conversation,
-        apply_chat_template=True,
-        continue_final_message=False,
-        end_of_think_mask=False,
-        last_turn_only=False,
-    ):
-        contents = []
-
-        if apply_chat_template:
-            # get default system prompt length for constructing user/assistant messages
-            default_system_prompt = self.tokenizer.apply_chat_template([{}], tokenize=False)
-            default_system_prompt_length = len(default_system_prompt)
-
-            # add system prompt
-            if (len(conversation) > 0 and conversation[0].role == "system"):
-                # custom system prompt
-                assert len(conversation[0].contents) == 1 and conversation[0].contents[0].type == "text"
-                system_prompt = self.tokenizer.apply_chat_template([{"role": "system", "content": conversation[0].contents[0].content}], tokenize=False)
-            else:
-                system_prompt = default_system_prompt
-            if len(system_prompt) > 0:
-                contents.append(Content(type="text", content=system_prompt, is_target=False))
-        else:
-            default_system_prompt_length = 0
-
-        for turn_idx, turn in enumerate(conversation):
-            # system prompt has been handled before
-            if turn.role == "system":
-                continue
-
-            # FIXME: use is_target in contents?
-            is_target = (turn.role == "assistant") and ((not last_turn_only) or turn_idx == len(conversation) - 1)
-            if apply_chat_template:
-                turn_text = self.tokenizer.apply_chat_template([{"role": turn.role, "content": MIMO_PLACEHOLDER}], tokenize=False)
-                turn_start_text, turn_end_text = turn_text[default_system_prompt_length:].split(MIMO_PLACEHOLDER)
-                contents.append(Content(type="text", content=turn_start_text, is_target=is_target))
-
-            for content in turn.contents:
-                if content.type == "text":
-                    text = content.content
-                    if content.is_target is not None:
-                        text_is_target = content.is_target
-                    else:
-                        text_is_target = is_target
-
-                    # TODO: check
-                    if text_is_target and end_of_think_mask:
-                        text_split = text.split("</think>\n\n")
-                        for i in range(len(text_split)-1):
-                            contents.append(Content(type="text", content=text_split[i], is_target=text_is_target))
-                            contents.append(Content(type="text", content="</think>\n\n", is_target=False))
-                        contents.append(Content(type="text", content=text_split[-1], is_target=text_is_target))
-                    else:
-                        contents.append(Content(type="text", content=text, is_target=text_is_target))
-                elif content.type == "image":
-                    contents.append(Content(type="image", content=content.content, is_target=is_target))
-                elif content.type == "video":
-                    contents.append(Content(type="video", content=content.content, is_target=is_target))
-                elif content.type == "audio":
-                    contents.append(Content(type="audio", content=content.content, is_target=is_target))
-                elif content.type == "video_audio":
-                    contents.append(Content(type="video_audio", content=content.content, is_target=is_target))
-                else:
-                    raise ValueError(f"unexpected content type {content.type} in {turn.contents}")
-
-            if apply_chat_template and not (continue_final_message and turn_idx == len(conversation) - 1):
-                contents.append(Content(type="text", content=turn_end_text, is_target=is_target))
-        # print(f"=====contents: {contents}")
-        return contents
-
-    def process_conversation(
-        self,
-        conversation: Conversation,
-        apply_chat_template=True,
-        continue_final_message=False,
-        end_of_think_mask=False,
-        last_turn_only=False,
-    ):
-        contents = self.convert_conversation_to_contents(
-            conversation,
-            apply_chat_template=apply_chat_template,
-            continue_final_message=continue_final_message,
-            end_of_think_mask=end_of_think_mask,
-            last_turn_only=last_turn_only,
-        )
-        return self.process(contents)
-
-
-    def process(
-            self,
-            contents: list[Content],
-            verbose: bool = True,
-        ):
-        verbose = False
+    def process(self, contents: list[Content], verbose: bool = False):
         input_ids, labels = [], []
         image_pixel_values, image_thw_grids = [], []
         video_pixel_values, video_thw_grids = [], []
         audio_inputs = []
         is_audio_tokenized = []
-        second_per_grid_ts = []             # for mrope
+        second_per_grid_ts = []
         extra = {}
-
         verbose_str = ""
 
-        # Pre-process all videos in parallel for better performance
-        video_contents_info = []  # List of (index, content, is_video_audio)
+        video_contents_info = []
         for idx, content in enumerate(contents):
             if content.type == "video":
                 video_contents_info.append((idx, content.content, False))
             elif content.type == "video_audio":
                 video_contents_info.append((idx, content.content, True))
 
-        # Process videos in parallel using ThreadPoolExecutor
-        video_results = {}  # index -> (video_tensor, timestamps, video_meta)
+        video_results = {}
         if len(video_contents_info) > 0:
             num_threads = min(self.video_process_num_threads, len(video_contents_info))
             if num_threads > 1 and len(video_contents_info) > 1:
-                # Parallel processing
                 with ThreadPoolExecutor(max_workers=num_threads) as executor:
                     future_to_idx = {
                         executor.submit(self.process_video, video_input): idx
@@ -1251,7 +795,6 @@ class MiMoVLProcessor:
                         except Exception as e:
                             raise RuntimeError(f"Error processing video at index {idx}: {e}") from e
             else:
-                # Sequential processing (when only 1 video or num_threads <= 1)
                 for idx, video_input, _ in video_contents_info:
                     video_results[idx] = self.process_video(video_input)
 
@@ -1270,7 +813,6 @@ class MiMoVLProcessor:
                         verbose_str += f"Text: [{content.content}]\n"
                     else:
                         verbose_str += f"Text: [{self.tokenizer.decode(content.content)}]\n"
-            # Only text can be target
             elif content.type == "image":
                 image_tensor = self.process_image(content.content)
                 visual_patches, thw_grid = self._flatten_visual_inputs(image_tensor, "image")
@@ -1284,7 +826,6 @@ class MiMoVLProcessor:
                     verbose_str += f"Image (shape={image_tensor.shape}, image_thw_grid={thw_grid}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
 
             elif content.type == "video":
-                # Use pre-computed video results from parallel processing
                 visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
                 grid_t, grid_h, grid_w = thw_grid
                 num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size ** 2) // self.temporal_compression_ratio
@@ -1312,11 +853,7 @@ class MiMoVLProcessor:
                         verbose_str += "<video_end>]\n"
 
                 else:
-                    # not implemented after adding video_start/video_end tags
                     raise NotImplementedError
-                    _input_ids = [self.vision_start_token_id] + [self.video_token_id] * num_media_tokens + [self.vision_end_token_id]
-                    if verbose:
-                        verbose_str += f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
 
                 second_per_grid_ts.append(self.temporal_patch_size / video_meta['fps_sampled'])
             elif content.type == "audio":
@@ -1336,18 +873,13 @@ class MiMoVLProcessor:
                     verbose_str += f"Audio (is_tokenized={is_audio_tokenized[-1]}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
 
             elif content.type == "video_audio":
-                video = content.content.video
-                audio = content.content.audio
-
-                # Use pre-computed video results from parallel processing
-                visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]  # timestamps is a list of seconds: e.g., [2.5, 5, 7.5, 10]
+                visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
                 second_per_grid_ts.append(self.temporal_patch_size / video_meta['fps_sampled'])
 
                 processed_audio = self.process_audio(content.content)
                 audio_token_per_second = self.audio_input_id_per_second / self.audio_group_size
 
                 grid_t, grid_h, grid_w = thw_grid
-                num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size ** 2) // self.temporal_compression_ratio
                 video_pixel_values.append(visual_patches)
                 video_thw_grids.append(thw_grid)
 
@@ -1361,20 +893,17 @@ class MiMoVLProcessor:
                         is_audio_tokenized.append(True)
                         audio_token_len = processed_audio.shape[0]
 
-                    video_audio_units = []        # (timestamp, timestamp_text, timestamp_ids, video_token_len, audio_token_len, video, audio)
+                    video_audio_units = []
 
                     num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size ** 2)
                     grid_t_timestamps = timestamps[::self.temporal_patch_size*self.temporal_compression_ratio]
                     text_timestamps = [format_timestamp(ts) for ts in grid_t_timestamps]
                     text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
 
-                    # bind each grid_t video, corresponding timestamps and audio
                     for i in range(len(grid_t_timestamps)):
                         timestamp = grid_t_timestamps[i]
                         timestamp_text = text_timestamps[i]
                         timestamp_ids = text_timestamp_ids[i]
-                        video_token_len = num_media_tokens_per_grid
-                        segment_video = None
 
                         audio_start_token_idx = int(grid_t_timestamps[i] * audio_token_per_second)
                         audio_end_token_idx = int(grid_t_timestamps[i+1] * audio_token_per_second) if i < len(grid_t_timestamps) - 1 else int(video_meta["segment_end_time"] * audio_token_per_second)
@@ -1382,9 +911,8 @@ class MiMoVLProcessor:
                         segment_audio_token_len = min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
                         assert segment_audio_token_len > 0
                         segment_audio = processed_audio[audio_start_token_idx:audio_start_token_idx+segment_audio_token_len] if is_audio_tokenized[-1] else None
-                        video_audio_units.append((timestamp, timestamp_text, timestamp_ids, video_token_len, segment_audio_token_len, segment_video, segment_audio))
+                        video_audio_units.append((timestamp, timestamp_text, timestamp_ids, num_media_tokens_per_grid, segment_audio_token_len, segment_audio))
 
-                    # group based on video_audio_interleave_length
                     if self.video_audio_interleave_length == -1:
                         groups = [[(i, u) for i, u in enumerate(video_audio_units)]]
                     elif self.video_audio_interleave_length == 0:
@@ -1404,8 +932,6 @@ class MiMoVLProcessor:
                                 current_group = []
                             time_ptr += self.video_audio_interleave_length
 
-                    # each group follows the format <timestamp> <frames> <audio_start> <audio> <audio_end>
-
                     _input_ids = [self.video_start_token_id]
                     if verbose: verbose_str += f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, is_audio_tokenized={is_audio_tokenized[-1]}, audio_token_len={audio_token_len}): [<video_start> "
                     for group in groups:
@@ -1415,7 +941,7 @@ class MiMoVLProcessor:
                         _video_tokens, _audio_tokens = [], []
                         video_verbose_str, audio_verbose_str = "", ""
                         for unit_idx, unit in group:
-                            timestamp, timestamp_text, timestamp_ids, video_token_len, segment_audio_token_len, segment_video, segment_audio = unit
+                            timestamp, timestamp_text, timestamp_ids, video_token_len, segment_audio_token_len, segment_audio = unit
                             if self.use_per_grid_t_timestamps:
                                 _video_tokens += timestamp_ids
                                 _audio_tokens += timestamp_ids
@@ -1425,7 +951,6 @@ class MiMoVLProcessor:
                             video_verbose_str += f"[{','.join([f'{ts:.2f}' for ts in timestamps.tolist()[unit_idx*self.temporal_patch_size*self.temporal_compression_ratio : (unit_idx+1)*self.temporal_patch_size*self.temporal_compression_ratio]])}] <vision_start> {video_token_len}*<video> <vision_end> "
                             _audio_tokens += [self.audio_token_id] * segment_audio_token_len
                             audio_verbose_str += f"{segment_audio_token_len}*<audio> "
-                            assert segment_video is None
                             if segment_audio is not None:
                                 audio_inputs.append(segment_audio)
 
@@ -1435,23 +960,7 @@ class MiMoVLProcessor:
                     if verbose: verbose_str += "<video_end>]\n"
 
                 else:
-                    # not implemented after adding video_start/video_end tags
                     raise NotImplementedError
-                    _input_ids = [self.vision_start_token_id] + [self.video_token_id] * num_media_tokens + [self.vision_end_token_id]
-                    if verbose: verbose_str += f"Video (shape={video_tensor.shape}, video_thw_grid={thw_grid}, video_meta={video_meta}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
-
-                    if not is_audio_tokenized[-1]:
-                        _input_ids += [self.audio_start_token_id] + [self.audio_token_id] * audio_token_len + [self.audio_end_token_id]
-                        if verbose: verbose_str += f"Audio (is_tokenized={is_audio_tokenized[-1]}, shape={processed_audio[0].shape}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
-                    else:
-                        start_time, end_time = video_meta["segment_start_time"], video_meta["segment_end_time"]
-                        start_token_idx = int(start_time * audio_token_per_second)
-                        end_token_idx = int(end_time * audio_token_per_second)
-                        audio_inputs.append(processed_audio[start_token_idx:end_token_idx])
-                        audio_token_len = processed_audio[start_token_idx:end_token_idx].shape[0]
-                        _input_ids += [self.audio_start_token_id] + [self.audio_token_id] * audio_token_len + [self.audio_end_token_id]
-
-                        if verbose: verbose_str += f"Audio (is_tokenized={is_audio_tokenized[-1]}, shape={processed_audio.shape}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
 
             input_ids.extend(_input_ids)
             labels.extend(_labels or [self.pad_token_id] * len(_input_ids))
@@ -1483,7 +992,6 @@ class MiMoVLProcessor:
                 input_ids=input_ids[None, :],
             )
             position_ids = position_ids.squeeze(1)
-            # print(position_ids.shape, rope_deltas.shape)
 
         if verbose:
             print(verbose_str.strip())
@@ -1527,10 +1035,8 @@ class MiMoVLProcessor:
             self.merge_size,
             self.patch_size,
         )
-        # (grid_t, grid_h/merge, grid_w/merge, merge_h, merge_w, channel, temporal, patch_h, patch_w)
         patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).contiguous()
-        
-        # (num_patches, patch_dim)
+
         flatten_patches = patches.view(
             grid_t * grid_h * grid_w,
             channel * self.temporal_patch_size * self.patch_size * self.patch_size,
@@ -1540,78 +1046,9 @@ class MiMoVLProcessor:
         return flatten_patches, thw_grids
 
 
-# ---------------------------------------------------------------------------
-# MiMoV2OmniProcessor (sglang integration)
-# ---------------------------------------------------------------------------
-
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
-
-
-class _AsNumpyArray:
-    def __init__(self, array):
-        self._array = array
-
-    def asnumpy(self):
-        return self._array
-
-
-def _as_numpy_array(batch):
-    if isinstance(batch, torch.Tensor):
-        return batch.detach().cpu().numpy()
-    if isinstance(batch, np.ndarray):
-        return batch
-    if hasattr(batch, "numpy"):
-        return batch.numpy()
-    return None
-
-
-class _VideoReaderAsNumpyAdapter:
-    def __init__(self, reader):
-        self._reader = reader
-
-    def __len__(self):
-        return len(self._reader)
-
-    def get_avg_fps(self):
-        return self._reader.get_avg_fps()
-
-    def get_batch(self, idx):
-        batch = self._reader.get_batch(idx)
-        if hasattr(batch, "asnumpy"):
-            return batch
-        array = _as_numpy_array(batch)
-        if array is None:
-            return batch
-        return _AsNumpyArray(array)
-
-
-def _wrap_video_reader(video):
-    if all(hasattr(video, attr) for attr in ("get_batch", "__len__", "get_avg_fps")):
-        return _VideoReaderAsNumpyAdapter(video)
-    return video
-
-
-def _to_mimo_video(video_result):
-    if (
-        isinstance(video_result, tuple)
-        and len(video_result) == 2
-        and isinstance(video_result[1], dict)
-    ):
-        video_tensor, metadata = video_result
-        frames_indices = metadata.get("frames_indices")
-        if frames_indices is None:
-            frames_indices = np.arange(video_tensor.shape[0])
-        fps = metadata.get("fps")
-        if fps:
-            timestamps = torch.as_tensor(frames_indices, dtype=torch.float32) / float(
-                fps
-            )
-        else:
-            timestamps = torch.as_tensor(frames_indices, dtype=torch.float32)
-        return (video_tensor, timestamps)
-    return video_result
 
 
 def has_audio_track(path_or_data: str) -> bool:
@@ -1687,7 +1124,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         self.video_start_token_id = processor_config.get("video_start_token_id", None)
         self.video_end_token_id = processor_config.get("video_end_token_id", None)
 
-        deivce = server_args.device if use_image_processor_gpu else None
+        device = server_args.device if use_image_processor_gpu else None
 
         self.mimo_processor = MiMoVLProcessor(
             tokenizer=self._processor.tokenizer,
@@ -1724,7 +1161,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             pad_token_id=self._processor.tokenizer.pad_token_id,
             rope_type=rope_type,
             use_video_timestamps=processor_config.get("use_video_timestamps", False),
-            device=deivce,
+            device=device,
         )
         self._processor = self.mimo_processor
 
@@ -1752,324 +1189,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
     def spatial_merge_size(self):
         return self.vision_config.spatial_merge_size
 
-    def build_input_ids(self, prompt, grid_thw, mm_token_id, modality_name):
-        if not isinstance(prompt, list):
-            prompt = self.mimo_processor.tokenizer.encode(prompt)
-
-        spatial_merge_size = self.spatial_merge_size
-        input_ids = []
-        offsets = []
-
-        cur_idx = 0
-        mm_start_indices = list(
-            filter(lambda i: prompt[i + 1] == mm_token_id, range(len(prompt) - 1))
-        )
-
-        for cur_mm_idx, mm_start_idx in enumerate(mm_start_indices):
-            assert cur_idx <= mm_start_idx
-            # include img_start_id
-            input_ids.extend(prompt[cur_idx : mm_start_idx + 1])
-            mm_offset_start = len(input_ids)
-            mm_token_num = grid_thw[cur_mm_idx].prod() // (spatial_merge_size**2)
-            input_ids.extend([mm_token_id] * mm_token_num)
-            # jump to img_end_id
-            cur_idx = mm_start_idx + 2
-            offsets.append((mm_offset_start, len(input_ids) - 1))
-        else:
-            input_ids.extend(prompt[cur_idx:])
-
-        return input_ids, offsets
-
-    def build_audio_input_ids(self, prompt, audio_lens, audio_token_id):
-        if not isinstance(prompt, list):
-            prompt = self.mimo_processor.tokenizer.encode(prompt)
-
-        if audio_lens is None:
-            audio_lens = []
-        if isinstance(audio_lens, torch.Tensor):
-            audio_lens = audio_lens.flatten().tolist()
-
-        audio_token_ids = {audio_token_id}
-        try:
-            audio_pad_id = self.mimo_processor.tokenizer.encode("<|audio_pad|>")[0]
-            audio_token_ids.add(audio_pad_id)
-        except Exception:
-            audio_pad_id = None
-
-        input_ids = []
-        offsets = []
-        cur_idx = 0
-
-        audio_start_indices = []
-        for i in range(len(prompt) - 1):
-            if (
-                prompt[i] == self.AUDIO_START_TOKEN_ID
-                and prompt[i + 1] in audio_token_ids
-            ):
-                audio_start_indices.append(i)
-            elif prompt[i] == self.AUDIO_START_TOKEN_ID:
-                logger.warning(
-                    "[EPD] Audio start token found without audio token. "
-                    f"audio_start_id={self.AUDIO_START_TOKEN_ID}, "
-                    f"audio_token_id={audio_token_id}, "
-                    f"audio_pad_id={audio_pad_id}, "
-                    f"prompt_len={len(prompt)}."
-                )
-
-        if len(audio_start_indices) == 0 and audio_lens:
-            logger.warning(
-                "[EPD] No audio tokens found in prompt. "
-                f"audio_start_id={self.AUDIO_START_TOKEN_ID}, "
-                f"audio_token_id={audio_token_id}, "
-                f"prompt_len={len(prompt)}, audio_lens={audio_lens}. "
-                f"First 50 tokens: {prompt}. "
-            )
-            audio_start_indices = [0]
-
-        for cur_audio_idx, audio_start_idx in enumerate(audio_start_indices):
-            assert cur_idx <= audio_start_idx
-            input_ids.extend(prompt[cur_idx : audio_start_idx + 1])
-            audio_offset_start = len(input_ids)
-            audio_token_num = (
-                int(audio_lens[cur_audio_idx]) if cur_audio_idx < len(audio_lens) else 0
-            )
-            input_ids.extend([audio_token_id] * audio_token_num)
-            cur_idx = audio_start_idx + 2
-            offsets.append((audio_offset_start, len(input_ids) - 1))
-        else:
-            input_ids.extend(prompt[cur_idx:])
-
-        return input_ids, offsets
-
-    def get_mm_data(
-        self,
-        prompt,
-        embeddings,
-        grid_thw,
-        *,
-        modality=Modality.IMAGE,
-        second_per_grid_ts=None,
-    ):
-        """
-        Build mm_inputs from precomputed embeddings for EPD disaggregation mode.
-        """
-        if isinstance(modality, str):
-            modality = Modality.from_str(modality)
-
-        # Ensure prompt contains the appropriate multimodal token placeholder
-        # This is needed for EPD disaggregation mode where prompt may not have placeholders
-        prompt_text = prompt if isinstance(prompt, str) else ""
-        if modality == Modality.AUDIO:
-            if prompt_text and not self.AUDIO_TOKEN_REGEX.search(prompt_text):
-                prompt = f"{self.mm_tokens.audio_token}{prompt_text}"
-        elif modality == Modality.VIDEO:
-            video_token_regex = self.mm_tokens.video_token_regex
-            if (
-                prompt_text
-                and video_token_regex
-                and not video_token_regex.search(prompt_text)
-            ):
-                # Insert video placeholder at the beginning if not present
-                prompt = f"{self.mm_tokens.video_token}{prompt_text}"
-        elif modality == Modality.IMAGE:
-            image_token_regex = self.mm_tokens.image_token_regex
-            if (
-                prompt_text
-                and image_token_regex
-                and not image_token_regex.search(prompt_text)
-            ):
-                # Insert image placeholder at the beginning if not present
-                prompt = f"{self.mm_tokens.image_token}{prompt_text}"
-
-        if modality == Modality.VIDEO:
-            mm_token_id = self.mm_tokens.video_token_id
-            modality_name = "video"
-            input_ids, offsets = self.build_input_ids(
-                prompt, grid_thw, mm_token_id, modality_name
-            )
-        elif modality == Modality.AUDIO:
-            mm_token_id = self.mm_tokens.audio_token_id
-            modality_name = "audio"
-            input_ids, offsets = self.build_audio_input_ids(
-                prompt, grid_thw, mm_token_id
-            )
-        else:
-            mm_token_id = self.mm_tokens.image_token_id
-            modality_name = "image"
-            input_ids, offsets = self.build_input_ids(
-                prompt, grid_thw, mm_token_id, modality_name
-            )
-        if (
-            second_per_grid_ts is None
-            and modality == Modality.VIDEO
-            and grid_thw is not None
-        ):
-            second_per_grid_ts = torch.ones((grid_thw.shape[0],), dtype=torch.float32)
-
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type="qwen2_5_vl",
-            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
-            image_grid_thw=grid_thw if modality == Modality.IMAGE else None,
-            video_grid_thw=grid_thw if modality == Modality.VIDEO else None,
-            tokens_per_second=getattr(self.vision_config, "tokens_per_second", None),
-            second_per_grid_ts=second_per_grid_ts,
-        )
-        mrope_positions = mrope_positions.squeeze(1)
-
-        mm_item = MultimodalDataItem(
-            modality=modality,
-            offsets=offsets,
-            precomputed_embeddings=embeddings,
-        )
-        if modality == Modality.IMAGE:
-            mm_items = mm_item.split_by_offset()
-        else:
-            mm_items = [mm_item]
-
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.mimo_processor.image_token_id,
-            "video_token_id": self.mimo_processor.video_token_id,
-            "audio_token_id": self.mimo_processor.audio_token_id,
-            "audio_start_id": self.AUDIO_START_TOKEN_ID,
-            "audio_end_id": self.AUDIO_END_TOKEN_ID,
-            "mrope_positions": mrope_positions,
-            "mrope_position_delta": mrope_position_delta,
-        }
-
-    def get_mm_data_video(
-        self,
-        prompt,
-        video_embeddings,
-        video_grid_thw,
-        audio_embeddings=None,
-        audio_lens=None,
-        *,
-        second_per_grid_ts=None,
-    ):
-        """
-        Build mm_inputs from precomputed embeddings for video (and optionally audio) in EPD mode.
-
-        When audio_embeddings and audio_lens are provided, this handles video+audio data.
-        When they are None, this handles video-only data.
-        """
-        has_audio = audio_embeddings is not None and audio_lens is not None
-
-        # Ensure prompt contains video token placeholder
-        if isinstance(prompt, str):
-            video_token_regex = self.mm_tokens.video_token_regex
-            if video_token_regex and not video_token_regex.search(prompt):
-                prompt = f"{self.mm_tokens.video_token}{prompt}"
-
-            # If we have audio, also add audio token placeholder
-            if has_audio and not self.AUDIO_TOKEN_REGEX.search(prompt):
-                # Find the video end token and insert audio after it
-                vision_end_pattern = r"<\|vision_end\|>"
-                import re as _re
-
-                match = _re.search(vision_end_pattern, prompt)
-                if match:
-                    # Insert audio token after vision_end
-                    insert_pos = match.end()
-                    prompt = (
-                        prompt[:insert_pos]
-                        + self.mm_tokens.audio_token
-                        + prompt[insert_pos:]
-                    )
-                else:
-                    # Fallback: append at the end of content (before assistant marker if present)
-                    assistant_marker = "<|im_start|>assistant"
-                    if assistant_marker in prompt:
-                        idx = prompt.rfind(assistant_marker)
-                        prompt = (
-                            prompt[:idx] + self.mm_tokens.audio_token + prompt[idx:]
-                        )
-                    else:
-                        prompt = prompt + self.mm_tokens.audio_token
-
-        input_ids, video_offsets = self.build_input_ids(
-            prompt, video_grid_thw, self.mm_tokens.video_token_id, "video"
-        )
-
-        audio_offsets = []
-        if has_audio:
-            audio_lens_list = (
-                audio_lens.flatten().tolist()
-                if isinstance(audio_lens, torch.Tensor)
-                else audio_lens
-            )
-            input_ids, audio_offsets = self.build_audio_input_ids(
-                input_ids,
-                audio_lens_list,
-                self.mm_tokens.audio_token_id,
-            )
-
-        rope_model_type = "qwen2_5_vl"
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.vision_config.spatial_merge_size,
-            image_token_id=self.IM_TOKEN_ID,
-            video_token_id=self.VIDEO_TOKEN_ID,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=rope_model_type,
-            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
-            image_grid_thw=None,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts
-            if second_per_grid_ts is not None
-            else torch.ones((video_grid_thw.shape[0],), dtype=torch.float32),
-            tokens_per_second=getattr(self.vision_config, "tokens_per_second", None),
-        )
-        mrope_positions = mrope_positions.squeeze(1)
-
-        mm_items = [
-            MultimodalDataItem(
-                modality=Modality.VIDEO,
-                offsets=video_offsets,
-                precomputed_embeddings=video_embeddings,
-            ),
-        ]
-
-        if has_audio:
-            mm_items.append(
-                MultimodalDataItem(
-                    modality=Modality.AUDIO,
-                    offsets=audio_offsets,
-                    precomputed_embeddings=audio_embeddings,
-                )
-            )
-
-        result = {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.mimo_processor.image_token_id,
-            "video_token_id": self.mimo_processor.video_token_id,
-            "mrope_positions": mrope_positions,
-            "mrope_position_delta": mrope_position_delta,
-        }
-
-        if has_audio:
-            result["audio_token_id"] = self.mimo_processor.audio_token_id
-            result["audio_start_id"] = self.AUDIO_START_TOKEN_ID
-            result["audio_end_id"] = self.AUDIO_END_TOKEN_ID
-
-        return result
-
     def _preprocess_video_sync(self, vdw, preprocess_kwargs=None):
-        """Sample frames from a pre-loaded VideoDecoderWrapper.
-
-        Returns (video_tensor, timestamps) tuple suitable for VideoInput.
-        video_tensor: TCHW float Tensor
-        timestamps: 1D float Tensor of per-frame timestamps in seconds
-        """
         ele = preprocess_kwargs or {}
         total_frames, video_fps = len(vdw), vdw.avg_fps
         nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
@@ -2077,13 +1197,13 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64))
         )
         try:
-            video_tensor = vdw.get_frames_as_tensor(idx)  # NHWC uint8 Tensor
+            video_tensor = vdw.get_frames_as_tensor(idx)
         except Exception as e:
             logger.error(f"Video decode failed in _preprocess_video_sync: {e}")
             raise HTTPException(
                 status_code=432, detail="Video file is corrupted or cannot be decoded"
             )
-        video_tensor = video_tensor.permute(0, 3, 1, 2).float()  # NHWC → TCHW float
+        video_tensor = video_tensor.permute(0, 3, 1, 2).float()
         timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
         return (video_tensor, timestamps)
 
@@ -2093,9 +1213,8 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         if audios and not self.AUDIO_TOKEN_REGEX.search(input_text or ""):
             input_text = f"{self.mm_tokens.audio_token}{input_text or ''}"
 
-        # Preprocess all multimodal items first
         processed_images = []
-        processed_videos = []  # List of (raw_video_source, use_audio, audio_source, preprocess_kwargs)
+        processed_videos = []
         processed_audios = []
 
         if images:
@@ -2120,11 +1239,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                     raw_video_source = video
                     audio_source = None
 
-                # Determine use_audio: check preprocess_kwargs first, then auto-detect
                 if "use_audio" in preprocess_kwargs:
                     use_audio = preprocess_kwargs["use_audio"]
                 elif isinstance(raw_video_source, str):
-                    # Auto-detect audio track if not specified
                     use_audio = has_audio_track(raw_video_source)
                 elif isinstance(video, VideoData):
                     use_audio = has_audio_track(raw_video_source.url)
@@ -2158,10 +1275,8 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 else:
                     processed_audios.append(audio_tensor.cpu().contiguous())
 
-        # Build contents with text parts interleaved with multimodal items
         contents = []
 
-        # If we have input_text, parse it to interleave text and multimodal content
         if input_text and (processed_images or processed_videos or processed_audios):
             multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
             text_parts = re.split(multimodal_tokens_pattern, input_text)
@@ -2257,11 +1372,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                         except StopIteration:
                             pass
                 else:
-                    # Add text content
                     if text_part:
                         contents.append(Content(type="text", content=text_part))
         else:
-            # Fallback: just add multimodal contents without text interleaving
             contents.extend(
                 Content(type="image", content=ImageInput(image=image))
                 for image in processed_images
@@ -2347,7 +1460,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                     "video_grid_thw": video_grids,
                 }
             )
-            # Add second_per_grid_ts for video temporal information (EPD alignment)
             second_per_grid_ts = getattr(input_sample, "second_per_grid_ts", None)
             if second_per_grid_ts is None:
                 second_per_grid_ts = getattr(
@@ -2355,7 +1467,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 )
             if second_per_grid_ts is not None:
                 ret["second_per_grid_ts"] = second_per_grid_ts
-            # Add video_start_token_id and video_end_token_id for EPD alignment
             ret["video_start_token_id"] = getattr(
                 self.mimo_processor, "video_start_token_id", None
             )
@@ -2418,7 +1529,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         )
         multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
 
-        # Reconstruct contents from base_output and request_obj metadata
         raw_image_data = image_data or []
         raw_video_data = getattr(request_obj, "video_data", None) or []
         raw_audio_data = audio_data or []
@@ -2431,7 +1541,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         raw_video_iter = iter(raw_video_data)
         raw_audio_iter = iter(raw_audio_data)
 
-        # base_output.input_text may contain replaced tokens, but we split by regex anyway
         text_parts = re.split(multimodal_tokens_pattern, base_output.input_text)
         contents = []
 
@@ -2482,7 +1591,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                         use_audio = has_audio_track(raw_video_item)
                         raw_video_item_audio = raw_video_item
 
-                    # Pre-process video: VideoDecoderWrapper → (TCHW tensor, timestamps) tuple
                     video_tuple = self._preprocess_video_sync(
                         loaded_video, preprocess_kwargs
                     )
@@ -2567,7 +1675,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 if text_part:
                     contents.append(Content(type="text", content=text_part))
 
-        # Run MiMo processor
         loop = asyncio.get_running_loop()
         try:
             input_sample = await loop.run_in_executor(
