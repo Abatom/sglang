@@ -11,10 +11,9 @@ from functools import wraps
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
@@ -34,35 +33,6 @@ else:
 
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Vector quantization (from MiMo-Audio-Tokenizer)
-# ---------------------------------------------------------------------------
-
-
-def _vq_default(val: tp.Any, d: tp.Any) -> tp.Any:
-    return val if val is not None else d
-
-
-def _uniform_init(*shape: int):
-    t = torch.empty(shape)
-    nn.init.kaiming_uniform_(t)
-    return t
-
-
-def _rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 def _compute_default_rope_parameters(
@@ -185,35 +155,11 @@ class AudioRotaryEmbedding(nn.Module):
 
 
 class EuclideanCodebook(nn.Module):
-    """Codebook with Euclidean distance.
-    Args:
-        dim (int): Dimension.
-        codebook_size (int): Codebook size.
-        kmeans_init (bool): Whether to use k-means to initialize the codebooks.
-            If set to true, run the k-means algorithm on the first training batch and use
-            the learned centroids as initialization.
-        kmeans_iters (int): Number of iterations used for k-means algorithm at initialization.
-        decay (float): Decay for exponential moving average over the codebooks.
-        epsilon (float): Epsilon value for numerical stability.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
-            that have an exponential moving average cluster size less than the specified threshold with
-            randomly selected vector from the current batch.
-    """
+    """Codebook with Euclidean distance (inference-only)."""
 
-    def __init__(
-        self,
-        dim: int,
-        codebook_size: int,
-        kmeans_init: int = False,
-        kmeans_iters: int = 10,
-        decay: float = 0.99,
-        epsilon: float = 1e-5,
-        threshold_ema_dead_code: int = 2,
-    ):
+    def __init__(self, dim: int, codebook_size: int, kmeans_init: bool = False, **kwargs):
         super().__init__()
-        init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = (
-            _uniform_init if not kmeans_init else torch.zeros
-        )
+        init_fn = self._uniform_init if not kmeans_init else torch.zeros
         embed = init_fn(codebook_size, dim)
 
         self.codebook_size = codebook_size
@@ -255,38 +201,26 @@ class EuclideanCodebook(nn.Module):
         quantize = self.dequantize(embed_ind)
         return quantize
 
+    @staticmethod
+    def _uniform_init(*shape: int):
+        t = torch.empty(shape)
+        nn.init.kaiming_uniform_(t)
+        return t
+
 
 class VectorQuantization(nn.Module):
-    """Vector quantization implementation.
-    Currently supports only euclidean distance.
-    Args:
-        dim (int): Dimension
-        codebook_size (int): Codebook size
-        codebook_dim (int): Codebook dimension. If not defined, uses the specified dimension in dim.
-        decay (float): Decay for exponential moving average over the codebooks.
-        epsilon (float): Epsilon value for numerical stability.
-        kmeans_init (bool): Whether to use kmeans to initialize the codebooks.
-        kmeans_iters (int): Number of iterations used for kmeans initialization.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
-            that have an exponential moving average cluster size less than the specified threshold with
-            randomly selected vector from the current batch.
-        commitment_weight (float): Weight for commitment loss.
-    """
+    """Vector quantization with euclidean distance (inference-only)."""
 
     def __init__(
         self,
         dim: int,
         codebook_size: int,
         codebook_dim: tp.Optional[int] = None,
-        decay: float = 0.99,
-        epsilon: float = 1e-5,
         kmeans_init: bool = True,
-        kmeans_iters: int = 50,
-        threshold_ema_dead_code: int = 2,
-        commitment_weight: float = 1.0,
+        **kwargs,
     ):
         super().__init__()
-        _codebook_dim: int = _vq_default(codebook_dim, dim)
+        _codebook_dim: int = codebook_dim if codebook_dim is not None else dim
 
         requires_projection = _codebook_dim != dim
         self.project_in = (
@@ -300,10 +234,6 @@ class VectorQuantization(nn.Module):
             dim=_codebook_dim,
             codebook_size=codebook_size,
             kmeans_init=kmeans_init,
-            kmeans_iters=kmeans_iters,
-            decay=decay,
-            epsilon=epsilon,
-            threshold_ema_dead_code=threshold_ema_dead_code,
         )
         self.codebook_size = codebook_size
 
@@ -365,45 +295,23 @@ class ResidualVectorQuantization(nn.Module):
 
 
 class ResidualVectorQuantizer(nn.Module):
-    """Residual Vector Quantizer.
-    Args:
-        dimension (int): Dimension of the codebooks.
-        n_q (int): Number of residual vector quantizers used.
-        bins (int): Codebook size.
-        decay (float): Decay for exponential moving average over the codebooks.
-        kmeans_init (bool): Whether to use kmeans to initialize the codebooks.
-        kmeans_iters (int): Number of iterations used for kmeans initialization.
-        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
-            that have an exponential moving average cluster size less than the specified threshold with
-            randomly selected vector from the current batch.
-    """
+    """Residual Vector Quantizer (inference-only)."""
 
     def __init__(
         self,
         dimension: int = 256,
         n_q: int = 8,
         bins: int | list = 1024,
-        decay: float = 0.99,
         kmeans_init: bool = True,
-        kmeans_iters: int = 50,
-        threshold_ema_dead_code: int = 2,
+        **kwargs,
     ):
         super().__init__()
         self.n_q = n_q
-        self.dimension = dimension
-        self.bins = bins
-        self.decay = decay
-        self.kmeans_init = kmeans_init
-        self.kmeans_iters = kmeans_iters
-        self.threshold_ema_dead_code = threshold_ema_dead_code
         self.vq = ResidualVectorQuantization(
-            dim=self.dimension,
-            codebook_size=self.bins,
-            num_quantizers=self.n_q,
-            decay=self.decay,
-            kmeans_init=self.kmeans_init,
-            kmeans_iters=self.kmeans_iters,
-            threshold_ema_dead_code=self.threshold_ema_dead_code,
+            dim=dimension,
+            codebook_size=bins,
+            num_quantizers=n_q,
+            kmeans_init=kmeans_init,
         )
 
     def encode(
@@ -417,11 +325,6 @@ class ResidualVectorQuantizer(nn.Module):
     def decode(self, codes: torch.Tensor, st: int = 0) -> torch.Tensor:
         quantized = self.vq.decode(codes, st=st)
         return quantized
-
-
-# ---------------------------------------------------------------------------
-# Audio tokenizer
-# ---------------------------------------------------------------------------
 
 
 class MiMoAudioTokenizerConfig(PretrainedConfig):
@@ -608,7 +511,7 @@ class AudioEncoderAttention(nn.Module):
 
         if rope_position_embeddings is not None:
             cos, sin = rope_position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states = self.apply_rotary_pos_emb(
                 query_states, key_states, cos, sin
             )
 
@@ -627,6 +530,20 @@ class AudioEncoderAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, self.embed_dim)
         attn_output = self.out_proj(attn_output)
         return attn_output
+
+    @staticmethod
+    def _rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @classmethod
+    def apply_rotary_pos_emb(cls, q, k, cos, sin, unsqueeze_dim=1):
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (cls._rotate_half(q) * sin)
+        k_embed = (k * cos) + (cls._rotate_half(k) * sin)
+        return q_embed, k_embed
 
 
 class AudioEncoderTransformerLayer(nn.Module):
@@ -910,11 +827,6 @@ class MiMoAudioTokenizer(PreTrainedModel):
         return hidden_states, hidden_states_packed, encoder_output_length, codes
 
 
-# ---------------------------------------------------------------------------
-# Audio encoding utilities
-# ---------------------------------------------------------------------------
-
-
 def group_by_length(features: torch.Tensor, lengths: torch.Tensor, max_length: int):
     if features.size(0) != lengths.sum().item():
         raise ValueError(
@@ -1008,11 +920,6 @@ def tokenize_audio_batch(mels, audio_tokenizer_encoder, segment_size=6000, devic
         code_lengths.append(out_len.sum().item())
     code_list = torch.split(codes, code_lengths)
     return list(code_list)
-
-
-# ---------------------------------------------------------------------------
-# Audio encoder (used by MiMoV2Omni)
-# ---------------------------------------------------------------------------
 
 
 @dataclass

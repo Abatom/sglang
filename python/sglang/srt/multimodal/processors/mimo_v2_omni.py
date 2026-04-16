@@ -452,7 +452,9 @@ class MiMoOmniProcessor:
 
         self.http_session = requests.Session()
         for k in kwargs:
-            logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoOmniProcessor")
+            logger.info(
+                f"[Warning] Ignored unknown parameter {k} for MiMoOmniProcessor"
+            )
 
     @property
     def mel_spectrogram(self):
@@ -870,9 +872,7 @@ class MiMoOmniProcessor:
                 :: self.temporal_patch_size * self.temporal_compression_ratio
             ]
         ]
-        text_timestamp_ids = [
-            self.tokenizer.encode(ts) for ts in text_timestamps
-        ]
+        text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
         _input_ids = (
             [self.video_start_token_id]
             + sum(
@@ -930,7 +930,9 @@ class MiMoOmniProcessor:
             "verbose": verbose_str,
         }
 
-    def _process_video_audio_content(self, content_idx, content, video_results, verbose):
+    def _process_video_audio_content(
+        self, content_idx, content, video_results, verbose
+    ):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
         grid_t, grid_h, grid_w = thw_grid
 
@@ -942,8 +944,7 @@ class MiMoOmniProcessor:
 
         if isinstance(processed_audio, tuple):
             assert (
-                content.content.start_time is None
-                and content.content.end_time is None
+                content.content.start_time is None and content.content.end_time is None
             ), "Audio start_time and end_time must be None when audio is not tokenized"
             is_tokenized = False
             audio_spec, audio_token_len = processed_audio
@@ -959,15 +960,11 @@ class MiMoOmniProcessor:
             :: self.temporal_patch_size * self.temporal_compression_ratio
         ]
         text_timestamps = [self.format_timestamp(ts) for ts in grid_t_timestamps]
-        text_timestamp_ids = [
-            self.tokenizer.encode(ts) for ts in text_timestamps
-        ]
+        text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
 
         video_audio_units = []
         for i in range(len(grid_t_timestamps)):
-            audio_start_token_idx = int(
-                grid_t_timestamps[i] * audio_token_per_second
-            )
+            audio_start_token_idx = int(grid_t_timestamps[i] * audio_token_per_second)
             audio_end_token_idx = (
                 int(grid_t_timestamps[i + 1] * audio_token_per_second)
                 if i < len(grid_t_timestamps) - 1
@@ -985,14 +982,16 @@ class MiMoOmniProcessor:
                 if is_tokenized
                 else None
             )
-            video_audio_units.append((
-                grid_t_timestamps[i],
-                text_timestamps[i],
-                text_timestamp_ids[i],
-                num_media_tokens_per_grid,
-                segment_audio_token_len,
-                segment_audio,
-            ))
+            video_audio_units.append(
+                (
+                    grid_t_timestamps[i],
+                    text_timestamps[i],
+                    text_timestamp_ids[i],
+                    num_media_tokens_per_grid,
+                    segment_audio_token_len,
+                    segment_audio,
+                )
+            )
 
         # Group units by interleave length
         if self.video_audio_interleave_length == -1:
@@ -1065,7 +1064,9 @@ class MiMoOmniProcessor:
                 + [self.audio_end_token_id]
             )
             if verbose:
-                verbose_str += f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
+                verbose_str += (
+                    f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
+                )
 
         _input_ids += [self.video_end_token_id]
         if verbose:
@@ -1435,7 +1436,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
 
         self.video_start_token_id = processor_config.get("video_start_token_id", None)
         self.video_end_token_id = processor_config.get("video_end_token_id", None)
-        self.use_image_processor_gpu = int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+        self.use_image_processor_gpu = (
+            int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+        )
         device = server_args.device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoOmniProcessor(
@@ -1631,8 +1634,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 for image in processed_images
             )
             contents.extend(
-                self._make_video_content(*video_data)
-                for video_data in processed_videos
+                self._make_video_content(*video_data) for video_data in processed_videos
             )
             contents.extend(
                 Content(type="audio", content=AudioInput(audio=audio))
@@ -1808,7 +1810,10 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                     )
                     contents.append(
                         self._make_video_content(
-                            video_tuple, use_audio, raw_video_item_audio, preprocess_kwargs
+                            video_tuple,
+                            use_audio,
+                            raw_video_item_audio,
+                            preprocess_kwargs,
                         )
                     )
                 elif modality == Modality.AUDIO:
@@ -1942,7 +1947,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             return False
 
     @staticmethod
-    def _make_video_content(processed_video, use_audio, audio_source, preprocess_kwargs):
+    def _make_video_content(
+        processed_video, use_audio, audio_source, preprocess_kwargs
+    ):
         video_kwargs = {
             k: preprocess_kwargs.get(k, None)
             for k in (
