@@ -24,9 +24,12 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
-assert is_cuda(), "MiMoAudioTokenizer requires CUDA to run."
-
-from sgl_kernel.flash_attn import flash_attn_varlen_func
+if is_cuda():
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+else:
+    # TODO: add non-CUDA support for MiMoAudioTokenizer
+    def flash_attn_varlen_func(*args, **kwargs):
+        raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
 
 logger = logging.getLogger(__name__)
 
