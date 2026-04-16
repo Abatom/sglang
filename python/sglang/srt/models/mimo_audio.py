@@ -285,7 +285,7 @@ class EuclideanCodebook(nn.Module):
 
     @torch.jit.ignore
     def init_embed_(self, data):
-        if self.inited:
+        if self.inited.bool().item():
             return
 
         embed, cluster_size = _kmeans(data, self.codebook_size, self.kmeans_iters)
