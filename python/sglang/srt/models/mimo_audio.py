@@ -45,16 +45,6 @@ def _vq_default(val: tp.Any, d: tp.Any) -> tp.Any:
     return val if val is not None else d
 
 
-def _ema_inplace(moving_avg, new, decay: float):
-    if dist.is_initialized():
-        dist.all_reduce(new, op=dist.ReduceOp.SUM)
-    moving_avg.data.mul_(decay).add_(new, alpha=(1 - decay))
-
-
-def _laplace_smoothing(x, n_categories: int, epsilon: float = 1e-5):
-    return (x + epsilon) / (x.sum() + n_categories * epsilon)
-
-
 def _uniform_init(*shape: int):
     t = torch.empty(shape)
     nn.init.kaiming_uniform_(t)
@@ -299,23 +289,6 @@ class EuclideanCodebook(nn.Module):
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.copy_(torch.Tensor([True]))
 
-    def replace_(self, samples, mask):
-        replace_num = mask.sum()
-        modified_codebook = self.embed.clone()
-        modified_codebook[mask] = _sample_vectors(samples, replace_num)
-        self.embed.data.copy_(modified_codebook)
-
-    def expire_codes_(self, batch_samples):
-        if self.threshold_ema_dead_code == 0:
-            return
-
-        expired_codes = self.cluster_size < self.threshold_ema_dead_code
-        if not torch.any(expired_codes):
-            return
-
-        batch_samples = rearrange(batch_samples, "... d -> (...) d")
-        self.replace_(batch_samples, mask=expired_codes)
-
     def preprocess(self, x):
         x = rearrange(x, "... d -> (...) d")
         return x
@@ -358,18 +331,6 @@ class EuclideanCodebook(nn.Module):
         embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
         embed_ind = self.postprocess_emb(embed_ind, shape)
         quantize = self.dequantize(embed_ind)
-
-        if self.training:
-            self.expire_codes_(x)
-            _ema_inplace(self.cluster_size, embed_onehot.sum(0), self.decay)
-            embed_sum = x.t() @ embed_onehot
-            _ema_inplace(self.embed_avg, embed_sum.t().contiguous(), self.decay)
-            cluster_size = (
-                _laplace_smoothing(self.cluster_size, self.codebook_size, self.epsilon)
-                * self.cluster_size.sum()
-            )
-            embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
-            self.embed.data.copy_(embed_normalized)
 
         return quantize, embed_ind
 
