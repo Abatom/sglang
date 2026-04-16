@@ -779,6 +779,309 @@ class MiMoOmniProcessor:
         )
         return padded_audio
 
+    def _process_videos_parallel(self, contents):
+        video_contents_info = []
+        for idx, content in enumerate(contents):
+            if content.type in ("video", "video_audio"):
+                video_contents_info.append((idx, content.content))
+
+        video_results = {}
+        if not video_contents_info:
+            return video_results
+
+        num_threads = min(self.video_process_num_threads, len(video_contents_info))
+        if num_threads > 1 and len(video_contents_info) > 1:
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                future_to_idx = {
+                    executor.submit(self.process_video, video_input): idx
+                    for idx, video_input in video_contents_info
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        video_results[idx] = future.result()
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Error processing video at index {idx}: {e}"
+                        ) from e
+        else:
+            for idx, video_input in video_contents_info:
+                video_results[idx] = self.process_video(video_input)
+        return video_results
+
+    def _process_text_content(self, content, verbose):
+        if isinstance(content.content, str):
+            _input_ids = self.tokenizer.encode(content.content)
+        else:
+            _input_ids = content.content
+        _labels = _input_ids if content.is_target else None
+
+        verbose_str = ""
+        if verbose:
+            if isinstance(content.content, str):
+                verbose_str = f"Text: [{content.content}]\n"
+            else:
+                verbose_str = f"Text: [{self.tokenizer.decode(content.content)}]\n"
+
+        return {"input_ids": _input_ids, "labels": _labels, "verbose": verbose_str}
+
+    def _process_image_content(self, content, verbose):
+        image_tensor = self.process_image(content.content)
+        visual_patches, thw_grid = self._flatten_visual_inputs(image_tensor, "image")
+        grid_t, grid_h, grid_w = thw_grid
+        num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size**2)
+        _input_ids = (
+            [self.vision_start_token_id]
+            + [self.image_token_id] * num_media_tokens
+            + [self.vision_end_token_id]
+        )
+
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"Image (shape={image_tensor.shape}, image_thw_grid={thw_grid}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "verbose": verbose_str,
+        }
+
+    def _process_video_content(self, content_idx, video_results, verbose):
+        visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
+        grid_t, grid_h, grid_w = thw_grid
+        num_media_tokens = (
+            (grid_t * grid_h * grid_w)
+            // (self.merge_size**2)
+            // self.temporal_compression_ratio
+        )
+
+        assert (
+            len(timestamps) == grid_t * self.temporal_patch_size
+        ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+
+        if not self.use_video_timestamps:
+            raise NotImplementedError
+
+        num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+        text_timestamps = [
+            self.format_timestamp(ts)
+            for ts in timestamps[
+                :: self.temporal_patch_size * self.temporal_compression_ratio
+            ]
+        ]
+        text_timestamp_ids = [
+            self.tokenizer.encode(ts) for ts in text_timestamps
+        ]
+        _input_ids = (
+            [self.video_start_token_id]
+            + sum(
+                [
+                    ts_ids
+                    + [self.vision_start_token_id]
+                    + [self.video_token_id] * num_media_tokens_per_grid
+                    + [self.vision_end_token_id]
+                    for ts_ids in text_timestamp_ids
+                ],
+                [],
+            )
+            + [self.video_end_token_id]
+        )
+
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
+            for i, ts in enumerate(text_timestamps):
+                verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i*self.temporal_patch_size*self.temporal_compression_ratio : (i+1)*self.temporal_patch_size*self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
+            verbose_str += "<video_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "second_per_grid_t": self.temporal_patch_size / video_meta["fps_sampled"],
+            "verbose": verbose_str,
+        }
+
+    def _process_audio_content(self, content, verbose):
+        processed_audio = self.process_audio(content.content)
+        if isinstance(processed_audio, tuple):
+            is_tokenized = False
+            audio_spec, audio_token_len = processed_audio
+            audio_input = audio_spec
+        else:
+            is_tokenized = True
+            audio_token_len = processed_audio.shape[0]
+            audio_input = processed_audio
+        _input_ids = (
+            [self.audio_start_token_id]
+            + [self.audio_token_id] * audio_token_len
+            + [self.audio_end_token_id]
+        )
+
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"Audio (is_tokenized={is_tokenized}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "audio_input": audio_input,
+            "is_tokenized": is_tokenized,
+            "verbose": verbose_str,
+        }
+
+    def _process_video_audio_content(self, content_idx, content, video_results, verbose):
+        visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
+        grid_t, grid_h, grid_w = thw_grid
+
+        processed_audio = self.process_audio(content.content)
+        audio_token_per_second = self.audio_input_id_per_second / self.audio_group_size
+
+        if not self.use_video_timestamps:
+            raise NotImplementedError
+
+        if isinstance(processed_audio, tuple):
+            assert (
+                content.content.start_time is None
+                and content.content.end_time is None
+            ), "Audio start_time and end_time must be None when audio is not tokenized"
+            is_tokenized = False
+            audio_spec, audio_token_len = processed_audio
+            audio_input = audio_spec
+        else:
+            is_tokenized = True
+            audio_token_len = processed_audio.shape[0]
+            audio_input = None
+
+        # Build video-audio units
+        num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+        grid_t_timestamps = timestamps[
+            :: self.temporal_patch_size * self.temporal_compression_ratio
+        ]
+        text_timestamps = [self.format_timestamp(ts) for ts in grid_t_timestamps]
+        text_timestamp_ids = [
+            self.tokenizer.encode(ts) for ts in text_timestamps
+        ]
+
+        video_audio_units = []
+        for i in range(len(grid_t_timestamps)):
+            audio_start_token_idx = int(
+                grid_t_timestamps[i] * audio_token_per_second
+            )
+            audio_end_token_idx = (
+                int(grid_t_timestamps[i + 1] * audio_token_per_second)
+                if i < len(grid_t_timestamps) - 1
+                else int(video_meta["segment_end_time"] * audio_token_per_second)
+            )
+            segment_audio_token_len = (
+                min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
+            )
+            assert segment_audio_token_len > 0
+            segment_audio = (
+                processed_audio[
+                    audio_start_token_idx : audio_start_token_idx
+                    + segment_audio_token_len
+                ]
+                if is_tokenized
+                else None
+            )
+            video_audio_units.append((
+                grid_t_timestamps[i],
+                text_timestamps[i],
+                text_timestamp_ids[i],
+                num_media_tokens_per_grid,
+                segment_audio_token_len,
+                segment_audio,
+            ))
+
+        # Group units by interleave length
+        if self.video_audio_interleave_length == -1:
+            groups = [list(enumerate(video_audio_units))]
+        elif self.video_audio_interleave_length == 0:
+            groups = [[(i, u)] for i, u in enumerate(video_audio_units)]
+        else:
+            assert self.video_audio_interleave_length > 0
+            groups = []
+            unit_idx = 0
+            current_group = []
+            time_ptr = 0
+            while unit_idx < len(video_audio_units):
+                while (
+                    unit_idx < len(video_audio_units)
+                    and video_audio_units[unit_idx][0] >= time_ptr
+                    and video_audio_units[unit_idx][0]
+                    < time_ptr + self.video_audio_interleave_length
+                ):
+                    current_group.append((unit_idx, video_audio_units[unit_idx]))
+                    unit_idx += 1
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                time_ptr += self.video_audio_interleave_length
+
+        # Build input_ids and collect audio segments
+        _input_ids = [self.video_start_token_id]
+        audio_segments = []
+        verbose_str = ""
+        if verbose:
+            verbose_str = f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, is_audio_tokenized={is_tokenized}, audio_token_len={audio_token_len}): [<video_start> "
+
+        for group in groups:
+            if not self.use_per_grid_t_timestamps:
+                _input_ids += group[0][1][2]
+                if verbose:
+                    verbose_str += f"{group[0][1][1]} "
+            _video_tokens, _audio_tokens = [], []
+            video_verbose_str, audio_verbose_str = "", ""
+            for unit_idx, unit in group:
+                (
+                    timestamp,
+                    timestamp_text,
+                    timestamp_ids,
+                    video_token_len,
+                    segment_audio_token_len,
+                    segment_audio,
+                ) = unit
+                if self.use_per_grid_t_timestamps:
+                    _video_tokens += timestamp_ids
+                    _audio_tokens += timestamp_ids
+                    video_verbose_str += timestamp_text + " "
+                    audio_verbose_str += timestamp_text + " "
+                _video_tokens += (
+                    [self.vision_start_token_id]
+                    + [self.video_token_id] * video_token_len
+                    + [self.vision_end_token_id]
+                )
+                video_verbose_str += f"[{','.join([f'{ts:.2f}' for ts in timestamps.tolist()[unit_idx*self.temporal_patch_size*self.temporal_compression_ratio : (unit_idx+1)*self.temporal_patch_size*self.temporal_compression_ratio]])}] <vision_start> {video_token_len}*<video> <vision_end> "
+                _audio_tokens += [self.audio_token_id] * segment_audio_token_len
+                audio_verbose_str += f"{segment_audio_token_len}*<audio> "
+                if segment_audio is not None:
+                    audio_segments.append(segment_audio)
+
+            _input_ids += (
+                _video_tokens
+                + [self.audio_start_token_id]
+                + _audio_tokens
+                + [self.audio_end_token_id]
+            )
+            if verbose:
+                verbose_str += f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
+
+        _input_ids += [self.video_end_token_id]
+        if verbose:
+            verbose_str += "<video_end>]\n"
+
+        return {
+            "input_ids": _input_ids,
+            "pixel_values": visual_patches,
+            "thw_grid": thw_grid,
+            "second_per_grid_t": self.temporal_patch_size / video_meta["fps_sampled"],
+            "audio_input": audio_input,
+            "audio_segments": audio_segments,
+            "is_tokenized": is_tokenized,
+            "verbose": verbose_str,
+        }
+
     def process(self, contents: list[Content], verbose: bool = False):
         input_ids, labels = [], []
         image_pixel_values, image_thw_grids = [], []
@@ -789,305 +1092,48 @@ class MiMoOmniProcessor:
         extra = {}
         verbose_str = ""
 
-        video_contents_info = []
-        for idx, content in enumerate(contents):
-            if content.type == "video":
-                video_contents_info.append((idx, content.content, False))
-            elif content.type == "video_audio":
-                video_contents_info.append((idx, content.content, True))
-
-        video_results = {}
-        if len(video_contents_info) > 0:
-            num_threads = min(self.video_process_num_threads, len(video_contents_info))
-            if num_threads > 1 and len(video_contents_info) > 1:
-                with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                    future_to_idx = {
-                        executor.submit(self.process_video, video_input): idx
-                        for idx, video_input, _ in video_contents_info
-                    }
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        try:
-                            video_results[idx] = future.result()
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"Error processing video at index {idx}: {e}"
-                            ) from e
-            else:
-                for idx, video_input, _ in video_contents_info:
-                    video_results[idx] = self.process_video(video_input)
+        video_results = self._process_videos_parallel(contents)
 
         for content_idx, content in enumerate(contents):
             _labels = None
+
             if content.type == "text":
-                if isinstance(content.content, str):
-                    _input_ids = self.tokenizer.encode(content.content)
-                else:
-                    _input_ids = content.content
-                if content.is_target:
-                    _labels = _input_ids
+                result = self._process_text_content(content, verbose)
+                _labels = result["labels"]
 
-                if verbose:
-                    if isinstance(content.content, str):
-                        verbose_str += f"Text: [{content.content}]\n"
-                    else:
-                        verbose_str += (
-                            f"Text: [{self.tokenizer.decode(content.content)}]\n"
-                        )
             elif content.type == "image":
-                image_tensor = self.process_image(content.content)
-                visual_patches, thw_grid = self._flatten_visual_inputs(
-                    image_tensor, "image"
-                )
-                grid_t, grid_h, grid_w = thw_grid
-                num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size**2)
-                image_pixel_values.append(visual_patches)
-                image_thw_grids.append(thw_grid)
-                _input_ids = (
-                    [self.vision_start_token_id]
-                    + [self.image_token_id] * num_media_tokens
-                    + [self.vision_end_token_id]
-                )
-
-                if verbose:
-                    verbose_str += f"Image (shape={image_tensor.shape}, image_thw_grid={thw_grid}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
+                result = self._process_image_content(content, verbose)
+                image_pixel_values.append(result["pixel_values"])
+                image_thw_grids.append(result["thw_grid"])
 
             elif content.type == "video":
-                visual_patches, thw_grid, timestamps, video_meta = video_results[
-                    content_idx
-                ]
-                grid_t, grid_h, grid_w = thw_grid
-                num_media_tokens = (
-                    (grid_t * grid_h * grid_w)
-                    // (self.merge_size**2)
-                    // self.temporal_compression_ratio
+                result = self._process_video_content(
+                    content_idx, video_results, verbose
                 )
-                video_pixel_values.append(visual_patches)
-                video_thw_grids.append(thw_grid)
+                video_pixel_values.append(result["pixel_values"])
+                video_thw_grids.append(result["thw_grid"])
+                second_per_grid_ts.append(result["second_per_grid_t"])
 
-                assert (
-                    len(timestamps) == grid_t * self.temporal_patch_size
-                ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
-
-                if self.use_video_timestamps:
-                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
-                    text_timestamps = [
-                        self.format_timestamp(ts)
-                        for ts in timestamps[
-                            :: self.temporal_patch_size
-                            * self.temporal_compression_ratio
-                        ]
-                    ]
-                    text_timestamp_ids = [
-                        self.tokenizer.encode(ts) for ts in text_timestamps
-                    ]
-                    _input_ids = (
-                        [self.video_start_token_id]
-                        + sum(
-                            [
-                                ts_ids
-                                + [self.vision_start_token_id]
-                                + [self.video_token_id] * num_media_tokens_per_grid
-                                + [self.vision_end_token_id]
-                                for ts_ids in text_timestamp_ids
-                            ],
-                            [],
-                        )
-                        + [self.video_end_token_id]
-                    )
-                    if verbose:
-                        verbose_str += f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
-                        for i, ts in enumerate(text_timestamps):
-                            verbose_str += f"{ts} <vision_start> {timestamps.tolist()[i*self.temporal_patch_size*self.temporal_compression_ratio : (i+1)*self.temporal_patch_size*self.temporal_compression_ratio]} {num_media_tokens_per_grid}*<vision> <vision_end> "
-                        verbose_str += "<video_end>]\n"
-
-                else:
-                    raise NotImplementedError
-
-                second_per_grid_ts.append(
-                    self.temporal_patch_size / video_meta["fps_sampled"]
-                )
             elif content.type == "audio":
-                audio = content.content
-                processed_audio = self.process_audio(audio)
-                if isinstance(processed_audio, tuple):
-                    is_audio_tokenized.append(False)
-                    audio_spec, audio_token_len = processed_audio
-                    audio_inputs.append(audio_spec)
-                else:
-                    audio_inputs.append(processed_audio)
-                    audio_token_len = processed_audio.shape[0]
-                    is_audio_tokenized.append(True)
-                _input_ids = (
-                    [self.audio_start_token_id]
-                    + [self.audio_token_id] * audio_token_len
-                    + [self.audio_end_token_id]
-                )
-
-                if verbose:
-                    verbose_str += f"Audio (is_tokenized={is_audio_tokenized[-1]}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
+                result = self._process_audio_content(content, verbose)
+                audio_inputs.append(result["audio_input"])
+                is_audio_tokenized.append(result["is_tokenized"])
 
             elif content.type == "video_audio":
-                visual_patches, thw_grid, timestamps, video_meta = video_results[
-                    content_idx
-                ]
-                second_per_grid_ts.append(
-                    self.temporal_patch_size / video_meta["fps_sampled"]
+                result = self._process_video_audio_content(
+                    content_idx, content, video_results, verbose
                 )
+                video_pixel_values.append(result["pixel_values"])
+                video_thw_grids.append(result["thw_grid"])
+                second_per_grid_ts.append(result["second_per_grid_t"])
+                is_audio_tokenized.append(result["is_tokenized"])
+                if result["audio_input"] is not None:
+                    audio_inputs.append(result["audio_input"])
+                audio_inputs.extend(result["audio_segments"])
 
-                processed_audio = self.process_audio(content.content)
-                audio_token_per_second = (
-                    self.audio_input_id_per_second / self.audio_group_size
-                )
-
-                grid_t, grid_h, grid_w = thw_grid
-                video_pixel_values.append(visual_patches)
-                video_thw_grids.append(thw_grid)
-
-                if self.use_video_timestamps:
-                    if isinstance(processed_audio, tuple):
-                        assert (
-                            content.content.start_time is None
-                            and content.content.end_time is None
-                        ), "Audio start_time and end_time must be None when audio is not tokenized"
-                        is_audio_tokenized.append(False)
-                        audio_spec, audio_token_len = processed_audio
-                        audio_inputs.append(audio_spec)
-                    else:
-                        is_audio_tokenized.append(True)
-                        audio_token_len = processed_audio.shape[0]
-
-                    video_audio_units = []
-
-                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
-                    grid_t_timestamps = timestamps[
-                        :: self.temporal_patch_size * self.temporal_compression_ratio
-                    ]
-                    text_timestamps = [self.format_timestamp(ts) for ts in grid_t_timestamps]
-                    text_timestamp_ids = [
-                        self.tokenizer.encode(ts) for ts in text_timestamps
-                    ]
-
-                    for i in range(len(grid_t_timestamps)):
-                        timestamp = grid_t_timestamps[i]
-                        timestamp_text = text_timestamps[i]
-                        timestamp_ids = text_timestamp_ids[i]
-
-                        audio_start_token_idx = int(
-                            grid_t_timestamps[i] * audio_token_per_second
-                        )
-                        audio_end_token_idx = (
-                            int(grid_t_timestamps[i + 1] * audio_token_per_second)
-                            if i < len(grid_t_timestamps) - 1
-                            else int(
-                                video_meta["segment_end_time"] * audio_token_per_second
-                            )
-                        )
-
-                        segment_audio_token_len = (
-                            min(audio_end_token_idx, audio_token_len)
-                            - audio_start_token_idx
-                        )
-                        assert segment_audio_token_len > 0
-                        segment_audio = (
-                            processed_audio[
-                                audio_start_token_idx : audio_start_token_idx
-                                + segment_audio_token_len
-                            ]
-                            if is_audio_tokenized[-1]
-                            else None
-                        )
-                        video_audio_units.append(
-                            (
-                                timestamp,
-                                timestamp_text,
-                                timestamp_ids,
-                                num_media_tokens_per_grid,
-                                segment_audio_token_len,
-                                segment_audio,
-                            )
-                        )
-
-                    if self.video_audio_interleave_length == -1:
-                        groups = [[(i, u) for i, u in enumerate(video_audio_units)]]
-                    elif self.video_audio_interleave_length == 0:
-                        groups = [[(i, u)] for i, u in enumerate(video_audio_units)]
-                    else:
-                        assert self.video_audio_interleave_length > 0
-                        groups = []
-                        unit_idx = 0
-                        current_group = []
-                        time_ptr = 0
-                        while unit_idx < len(video_audio_units):
-                            while (
-                                unit_idx < len(video_audio_units)
-                                and video_audio_units[unit_idx][0] >= time_ptr
-                                and video_audio_units[unit_idx][0]
-                                < time_ptr + self.video_audio_interleave_length
-                            ):
-                                current_group.append(
-                                    (unit_idx, video_audio_units[unit_idx])
-                                )
-                                unit_idx += 1
-                            if len(current_group) > 0:
-                                groups.append(current_group)
-                                current_group = []
-                            time_ptr += self.video_audio_interleave_length
-
-                    _input_ids = [self.video_start_token_id]
-                    if verbose:
-                        verbose_str += f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, is_audio_tokenized={is_audio_tokenized[-1]}, audio_token_len={audio_token_len}): [<video_start> "
-                    for group in groups:
-                        if not self.use_per_grid_t_timestamps:
-                            _input_ids += group[0][1][2]
-                            if verbose:
-                                verbose_str += f"{group[0][1][1]} "
-                        _video_tokens, _audio_tokens = [], []
-                        video_verbose_str, audio_verbose_str = "", ""
-                        for unit_idx, unit in group:
-                            (
-                                timestamp,
-                                timestamp_text,
-                                timestamp_ids,
-                                video_token_len,
-                                segment_audio_token_len,
-                                segment_audio,
-                            ) = unit
-                            if self.use_per_grid_t_timestamps:
-                                _video_tokens += timestamp_ids
-                                _audio_tokens += timestamp_ids
-                                video_verbose_str += timestamp_text + " "
-                                audio_verbose_str += timestamp_text + " "
-                            _video_tokens += (
-                                [self.vision_start_token_id]
-                                + [self.video_token_id] * video_token_len
-                                + [self.vision_end_token_id]
-                            )
-                            video_verbose_str += f"[{','.join([f'{ts:.2f}' for ts in timestamps.tolist()[unit_idx*self.temporal_patch_size*self.temporal_compression_ratio : (unit_idx+1)*self.temporal_patch_size*self.temporal_compression_ratio]])}] <vision_start> {video_token_len}*<video> <vision_end> "
-                            _audio_tokens += [
-                                self.audio_token_id
-                            ] * segment_audio_token_len
-                            audio_verbose_str += f"{segment_audio_token_len}*<audio> "
-                            if segment_audio is not None:
-                                audio_inputs.append(segment_audio)
-
-                        _input_ids += (
-                            _video_tokens
-                            + [self.audio_start_token_id]
-                            + _audio_tokens
-                            + [self.audio_end_token_id]
-                        )
-                        if verbose:
-                            verbose_str += f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
-                    _input_ids += [self.video_end_token_id]
-                    if verbose:
-                        verbose_str += "<video_end>]\n"
-
-                else:
-                    raise NotImplementedError
-
-            input_ids.extend(_input_ids)
-            labels.extend(_labels or [self.pad_token_id] * len(_input_ids))
+            input_ids.extend(result["input_ids"])
+            labels.extend(_labels or [self.pad_token_id] * len(result["input_ids"]))
+            verbose_str += result.get("verbose", "")
 
         input_ids = torch.tensor(input_ids)
         labels = np.roll(labels, shift=-1)
