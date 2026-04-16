@@ -1331,34 +1331,36 @@ class MiMoVLProcessor:
         return flatten_patches, thw_grids
 
 
-use_image_processor_gpu = (
-    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-)
-
-
-def has_audio_track(path_or_data: str) -> bool:
-    try:
-        is_base64 = path_or_data.startswith("data:") and ";base64," in path_or_data
-        cmd = [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_streams",
-            "-select_streams",
-            "a",
-            "pipe:0" if is_base64 else path_or_data,
-        ]
-        inp = base64.b64decode(path_or_data.split(";base64,")[1]) if is_base64 else None
-        r = subprocess.run(cmd, input=inp, capture_output=True, timeout=30)
-        return bool(r.returncode == 0 and json.loads(r.stdout).get("streams"))
-    except Exception:
-        return False
-
-
 class MiMoV2OmniProcessor(BaseMultimodalProcessor):
     models = [MiMoV2OmniForCausalLM]
+    use_image_processor_gpu = (
+        int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
+    )
+
+    @staticmethod
+    def has_audio_track(path_or_data: str) -> bool:
+        try:
+            is_base64 = path_or_data.startswith("data:") and ";base64," in path_or_data
+            cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "a",
+                "pipe:0" if is_base64 else path_or_data,
+            ]
+            inp = (
+                base64.b64decode(path_or_data.split(";base64,")[1])
+                if is_base64
+                else None
+            )
+            r = subprocess.run(cmd, input=inp, capture_output=True, timeout=30)
+            return bool(r.returncode == 0 and json.loads(r.stdout).get("streams"))
+        except Exception:
+            return False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -1409,7 +1411,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         self.video_start_token_id = processor_config.get("video_start_token_id", None)
         self.video_end_token_id = processor_config.get("video_end_token_id", None)
 
-        device = server_args.device if use_image_processor_gpu else None
+        device = server_args.device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoVLProcessor(
             tokenizer=self._processor.tokenizer,
@@ -1492,6 +1494,32 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
         return (video_tensor, timestamps)
 
+    @staticmethod
+    def _make_video_content(processed_video, use_audio, audio_source, preprocess_kwargs):
+        video_kwargs = {
+            k: preprocess_kwargs.get(k, None)
+            for k in (
+                "min_pixels",
+                "max_pixels",
+                "total_max_pixels",
+                "fps",
+                "num_frames",
+                "max_frames",
+                "min_frames",
+            )
+        }
+        if use_audio:
+            return Content(
+                type="video_audio",
+                content=VideoAudioInput(
+                    video=processed_video, audio=audio_source, **video_kwargs
+                ),
+            )
+        return Content(
+            type="video",
+            content=VideoInput(video=processed_video, **video_kwargs),
+        )
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -1527,9 +1555,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 if "use_audio" in preprocess_kwargs:
                     use_audio = preprocess_kwargs["use_audio"]
                 elif isinstance(raw_video_source, str):
-                    use_audio = has_audio_track(raw_video_source)
+                    use_audio = self.has_audio_track(raw_video_source)
                 elif isinstance(video, VideoData):
-                    use_audio = has_audio_track(raw_video_source.url)
+                    use_audio = self.has_audio_track(raw_video_source.url)
                 else:
                     use_audio = False
 
@@ -1583,69 +1611,8 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                             pass
                     elif modality == Modality.VIDEO:
                         try:
-                            (
-                                processed_video,
-                                use_audio,
-                                audio_source,
-                                preprocess_kwargs,
-                            ) = next(video_iter)
-                            if use_audio:
-                                contents.append(
-                                    Content(
-                                        type="video_audio",
-                                        content=VideoAudioInput(
-                                            video=processed_video,
-                                            audio=audio_source,
-                                            min_pixels=preprocess_kwargs.get(
-                                                "min_pixels", None
-                                            ),
-                                            max_pixels=preprocess_kwargs.get(
-                                                "max_pixels", None
-                                            ),
-                                            total_max_pixels=preprocess_kwargs.get(
-                                                "total_max_pixels", None
-                                            ),
-                                            fps=preprocess_kwargs.get("fps", None),
-                                            num_frames=preprocess_kwargs.get(
-                                                "num_frames", None
-                                            ),
-                                            max_frames=preprocess_kwargs.get(
-                                                "max_frames", None
-                                            ),
-                                            min_frames=preprocess_kwargs.get(
-                                                "min_frames", None
-                                            ),
-                                        ),
-                                    )
-                                )
-                            else:
-                                contents.append(
-                                    Content(
-                                        type="video",
-                                        content=VideoInput(
-                                            video=processed_video,
-                                            min_pixels=preprocess_kwargs.get(
-                                                "min_pixels", None
-                                            ),
-                                            max_pixels=preprocess_kwargs.get(
-                                                "max_pixels", None
-                                            ),
-                                            total_max_pixels=preprocess_kwargs.get(
-                                                "total_max_pixels", None
-                                            ),
-                                            fps=preprocess_kwargs.get("fps", None),
-                                            num_frames=preprocess_kwargs.get(
-                                                "num_frames", None
-                                            ),
-                                            max_frames=preprocess_kwargs.get(
-                                                "max_frames", None
-                                            ),
-                                            min_frames=preprocess_kwargs.get(
-                                                "min_frames", None
-                                            ),
-                                        ),
-                                    )
-                                )
+                            video_data = next(video_iter)
+                            contents.append(self._make_video_content(*video_data))
                         except StopIteration:
                             pass
                     elif modality == Modality.AUDIO:
@@ -1664,49 +1631,10 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                 Content(type="image", content=ImageInput(image=image))
                 for image in processed_images
             )
-            for (
-                processed_video,
-                use_audio,
-                audio_source,
-                preprocess_kwargs,
-            ) in processed_videos:
-                if use_audio:
-                    contents.append(
-                        Content(
-                            type="video_audio",
-                            content=VideoAudioInput(
-                                video=processed_video,
-                                audio=audio_source,
-                                min_pixels=preprocess_kwargs.get("min_pixels", None),
-                                max_pixels=preprocess_kwargs.get("max_pixels", None),
-                                total_max_pixels=preprocess_kwargs.get(
-                                    "total_max_pixels", None
-                                ),
-                                fps=preprocess_kwargs.get("fps", None),
-                                num_frames=preprocess_kwargs.get("num_frames", None),
-                                max_frames=preprocess_kwargs.get("max_frames", None),
-                                min_frames=preprocess_kwargs.get("min_frames", None),
-                            ),
-                        )
-                    )
-                else:
-                    contents.append(
-                        Content(
-                            type="video",
-                            content=VideoInput(
-                                video=processed_video,
-                                min_pixels=preprocess_kwargs.get("min_pixels", None),
-                                max_pixels=preprocess_kwargs.get("max_pixels", None),
-                                total_max_pixels=preprocess_kwargs.get(
-                                    "total_max_pixels", None
-                                ),
-                                fps=preprocess_kwargs.get("fps", None),
-                                num_frames=preprocess_kwargs.get("num_frames", None),
-                                max_frames=preprocess_kwargs.get("max_frames", None),
-                                min_frames=preprocess_kwargs.get("min_frames", None),
-                            ),
-                        )
-                    )
+            contents.extend(
+                self._make_video_content(*video_data)
+                for video_data in processed_videos
+            )
             contents.extend(
                 Content(type="audio", content=AudioInput(audio=audio))
                 for audio in processed_audios
@@ -1865,78 +1793,25 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                         preprocess_kwargs = (
                             getattr(raw_video_item, "preprocess_kwargs", {}) or {}
                         )
-                        use_audio = has_audio_track(raw_video_item.url)
+                        use_audio = self.has_audio_track(raw_video_item.url)
                         raw_video_item_audio = raw_video_item.url
                     elif isinstance(raw_video_item, dict):
-                        use_audio = has_audio_track(
+                        use_audio = self.has_audio_track(
                             raw_video_item.get("url", raw_video_item)
                         )
                         raw_video_item_audio = raw_video_item
                     elif isinstance(raw_video_item, str):
-                        use_audio = has_audio_track(raw_video_item)
+                        use_audio = self.has_audio_track(raw_video_item)
                         raw_video_item_audio = raw_video_item
 
                     video_tuple = self._preprocess_video_sync(
                         loaded_video, preprocess_kwargs
                     )
-
-                    if use_audio:
-                        contents.append(
-                            Content(
-                                type="video_audio",
-                                content=VideoAudioInput(
-                                    video=video_tuple,
-                                    audio=raw_video_item_audio,
-                                    min_pixels=preprocess_kwargs.get(
-                                        "min_pixels", None
-                                    ),
-                                    max_pixels=preprocess_kwargs.get(
-                                        "max_pixels", None
-                                    ),
-                                    total_max_pixels=preprocess_kwargs.get(
-                                        "total_max_pixels", None
-                                    ),
-                                    fps=preprocess_kwargs.get("fps", None),
-                                    num_frames=preprocess_kwargs.get(
-                                        "num_frames", None
-                                    ),
-                                    max_frames=preprocess_kwargs.get(
-                                        "max_frames", None
-                                    ),
-                                    min_frames=preprocess_kwargs.get(
-                                        "min_frames", None
-                                    ),
-                                ),
-                            )
+                    contents.append(
+                        self._make_video_content(
+                            video_tuple, use_audio, raw_video_item_audio, preprocess_kwargs
                         )
-                    else:
-                        contents.append(
-                            Content(
-                                type="video",
-                                content=VideoInput(
-                                    video=video_tuple,
-                                    min_pixels=preprocess_kwargs.get(
-                                        "min_pixels", None
-                                    ),
-                                    max_pixels=preprocess_kwargs.get(
-                                        "max_pixels", None
-                                    ),
-                                    total_max_pixels=preprocess_kwargs.get(
-                                        "total_max_pixels", None
-                                    ),
-                                    fps=preprocess_kwargs.get("fps", None),
-                                    num_frames=preprocess_kwargs.get(
-                                        "num_frames", None
-                                    ),
-                                    max_frames=preprocess_kwargs.get(
-                                        "max_frames", None
-                                    ),
-                                    min_frames=preprocess_kwargs.get(
-                                        "min_frames", None
-                                    ),
-                                ),
-                            )
-                        )
+                    )
                 elif modality == Modality.AUDIO:
                     loaded_audio = next(loaded_audio_iter)
                     raw_audio_item = next(raw_audio_iter)
