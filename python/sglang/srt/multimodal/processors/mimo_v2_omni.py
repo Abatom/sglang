@@ -218,7 +218,7 @@ TextInput = str | list[int]
 
 
 @dataclass
-class MiMoVLInputSample:
+class MiMoOmniInputSample:
     input_ids: torch.Tensor
     labels: Optional[torch.Tensor]
     pixel_values: list[torch.Tensor]
@@ -272,164 +272,12 @@ class Content:
                 )
 
 
-QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
-
+_QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+_QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
 _mean_std_cache = {}
 
 
-def format_timestamp(timestamp: float):
-    minutes = int(timestamp // 60)
-    seconds = int(timestamp % 60)
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-def smart_resize(
-    height: int, width: int, factor: int, min_pixels: int, max_pixels: int
-):
-    """Rescales the image so that the following conditions are met:
-
-    1. Both dimensions (height and width) are divisible by 'factor'.
-    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
-    3. The aspect ratio of the image is maintained as closely as possible.
-    """
-    if min(height, width) < factor:
-        if height < width:
-            height = factor
-            width = int(width * (factor / height))
-        else:
-            width = factor
-            height = int(height * (factor / width))
-    elif max(height, width) / min(height, width) > 200:
-        raise ValueError(
-            f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
-        )
-    h_bar = round(height / factor) * factor
-    w_bar = round(width / factor) * factor
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = math.floor(height / beta / factor) * factor
-        w_bar = math.floor(width / beta / factor) * factor
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return int(h_bar), int(w_bar)
-
-
-def to_rgb(pil_image: Image.Image) -> Image.Image:
-    if pil_image.mode == "RGBA":
-        white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
-        white_background.paste(pil_image, mask=pil_image.split()[3])
-        return white_background
-    else:
-        return pil_image.convert("RGB")
-
-
-def standardize_batch(images: torch.Tensor) -> torch.Tensor:
-    device_key = str(images.device)
-    if device_key not in _mean_std_cache:
-        _mean_std_cache[device_key] = (
-            torch.tensor(QWEN2VL_PIXEL_MEAN, device=images.device).view(1, -1, 1, 1),
-            torch.tensor(QWEN2VL_PIXEL_STD, device=images.device).view(1, -1, 1, 1),
-        )
-    mean, std = _mean_std_cache[device_key]
-    return (images - mean) / std
-
-
-def get_visual_transform_batch(
-    frames: torch.Tensor,
-    factor: int,
-    min_pixels: int,
-    max_pixels: int,
-    device: Optional[torch.device] = None,
-):
-    if device is not None:
-        frames = frames.to(device)
-
-    _, _, h, w = frames.shape
-    h_bar, w_bar = smart_resize(h, w, factor, min_pixels, max_pixels)
-
-    resized = F.interpolate(
-        frames.float(),
-        size=(h_bar, w_bar),
-        mode="bilinear",
-        align_corners=False,
-    )
-    standardized = standardize_batch(resized)
-
-    return standardized, w_bar, h_bar
-
-
-def get_visual_transform(
-    img: torch.Tensor | Image.Image,
-    factor: int,
-    min_pixels: int,
-    max_pixels: int,
-    device: Optional[torch.device] = None,
-):
-    if isinstance(img, torch.Tensor):
-        img_tensor = img.float()
-        _, h, w = img_tensor.shape
-    elif isinstance(img, Image.Image):
-        img = img.convert("RGB")
-        w, h = img.size
-        img_array = np.array(img)
-        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
-    else:
-        raise TypeError(
-            f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image"
-        )
-
-    if device is not None:
-        img_tensor = img_tensor.to(device)
-
-    h_bar, w_bar = smart_resize(h, w, factor, min_pixels, max_pixels)
-
-    img_resized = F.interpolate(
-        img_tensor.unsqueeze(0),
-        size=(h_bar, w_bar),
-        mode="bilinear",
-        align_corners=False,
-    )
-    img_standardized = standardize_batch(img_resized).squeeze(0)
-
-    return img_standardized, w_bar, h_bar
-
-
-def fetch_image(
-    image: Image.Image | str | bytes,
-):
-    image_obj = None
-    if isinstance(image, Image.Image):
-        image_obj = image
-    elif isinstance(image, str):
-        if image.startswith("http://") or image.startswith("https://"):
-            with requests.get(image, stream=True) as response:
-                response.raise_for_status()
-                with BytesIO(response.content) as bio:
-                    image_obj = copy.deepcopy(Image.open(bio))
-        elif image.startswith("file://"):
-            image_obj = Image.open(image[7:])
-        elif image.startswith("data:image"):
-            if "base64," in image:
-                _, base64_data = image.split("base64,", 1)
-                data = base64.b64decode(base64_data)
-                with BytesIO(data) as bio:
-                    image_obj = copy.deepcopy(Image.open(bio))
-        else:
-            image_obj = Image.open(image)
-    else:
-        image_obj = Image.open(BytesIO(image))
-    if image_obj is None:
-        raise ValueError(
-            f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
-        )
-    image = to_rgb(image_obj)
-    return image
-
-
-class MiMoVLProcessor:
+class MiMoOmniProcessor:
     def __init__(
         self,
         tokenizer,
@@ -604,7 +452,7 @@ class MiMoVLProcessor:
 
         self.http_session = requests.Session()
         for k in kwargs:
-            logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoVLProcessor")
+            logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoOmniProcessor")
 
     @property
     def mel_spectrogram(self):
@@ -740,8 +588,8 @@ class MiMoVLProcessor:
         kwargs = self.prepare_image_kwargs(image)
         image = image.image
         if isinstance(image, (str, bytes)):
-            image = fetch_image(image)
-        image_transformed_tensor, _, _ = get_visual_transform(
+            image = self.fetch_image(image)
+        image_transformed_tensor, _, _ = self.get_visual_transform(
             image,
             factor=self.patch_size * self.merge_size,
             min_pixels=kwargs["min_pixels"],
@@ -884,7 +732,7 @@ class MiMoVLProcessor:
                 [timestamps_seg, timestamps_seg[-1:].repeat(num_frames_needed)], dim=0
             )
 
-        video_transformed_tensor, _, _ = get_visual_transform_batch(
+        video_transformed_tensor, _, _ = self.get_visual_transform_batch(
             aligned_frames,
             factor=self.patch_size * self.merge_size,
             min_pixels=min_pixels,
@@ -1024,7 +872,7 @@ class MiMoVLProcessor:
                 if self.use_video_timestamps:
                     num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
                     text_timestamps = [
-                        format_timestamp(ts)
+                        self.format_timestamp(ts)
                         for ts in timestamps[
                             :: self.temporal_patch_size
                             * self.temporal_compression_ratio
@@ -1115,7 +963,7 @@ class MiMoVLProcessor:
                     grid_t_timestamps = timestamps[
                         :: self.temporal_patch_size * self.temporal_compression_ratio
                     ]
-                    text_timestamps = [format_timestamp(ts) for ts in grid_t_timestamps]
+                    text_timestamps = [self.format_timestamp(ts) for ts in grid_t_timestamps]
                     text_timestamp_ids = [
                         self.tokenizer.encode(ts) for ts in text_timestamps
                     ]
@@ -1275,7 +1123,7 @@ class MiMoVLProcessor:
         if verbose:
             print(verbose_str.strip())
 
-        return MiMoVLInputSample(
+        return MiMoOmniInputSample(
             input_ids=input_ids,
             labels=labels,
             pixel_values=image_pixel_values,
@@ -1330,37 +1178,168 @@ class MiMoVLProcessor:
 
         return flatten_patches, thw_grids
 
+    # ------------------------------------------------------------------
+    # Static / class-level utility methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_timestamp(timestamp: float):
+        minutes = int(timestamp // 60)
+        seconds = int(timestamp % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
+    def smart_resize(
+        height: int, width: int, factor: int, min_pixels: int, max_pixels: int
+    ):
+        """Rescales the image so that the following conditions are met:
+
+        1. Both dimensions (height and width) are divisible by 'factor'.
+        2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+        3. The aspect ratio of the image is maintained as closely as possible.
+        """
+        if min(height, width) < factor:
+            if height < width:
+                height = factor
+                width = int(width * (factor / height))
+            else:
+                width = factor
+                height = int(height * (factor / width))
+        elif max(height, width) / min(height, width) > 200:
+            raise ValueError(
+                f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
+            )
+        h_bar = round(height / factor) * factor
+        w_bar = round(width / factor) * factor
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = math.floor(height / beta / factor) * factor
+            w_bar = math.floor(width / beta / factor) * factor
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = math.ceil(height * beta / factor) * factor
+            w_bar = math.ceil(width * beta / factor) * factor
+        return int(h_bar), int(w_bar)
+
+    @staticmethod
+    def to_rgb(pil_image: Image.Image) -> Image.Image:
+        if pil_image.mode == "RGBA":
+            white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
+            white_background.paste(pil_image, mask=pil_image.split()[3])
+            return white_background
+        else:
+            return pil_image.convert("RGB")
+
+    @staticmethod
+    def standardize_batch(images: torch.Tensor) -> torch.Tensor:
+        device_key = str(images.device)
+        if device_key not in _mean_std_cache:
+            _mean_std_cache[device_key] = (
+                torch.tensor(_QWEN2VL_PIXEL_MEAN, device=images.device).view(
+                    1, -1, 1, 1
+                ),
+                torch.tensor(_QWEN2VL_PIXEL_STD, device=images.device).view(
+                    1, -1, 1, 1
+                ),
+            )
+        mean, std = _mean_std_cache[device_key]
+        return (images - mean) / std
+
+    @classmethod
+    def get_visual_transform_batch(
+        cls,
+        frames: torch.Tensor,
+        factor: int,
+        min_pixels: int,
+        max_pixels: int,
+        device: Optional[torch.device] = None,
+    ):
+        if device is not None:
+            frames = frames.to(device)
+
+        _, _, h, w = frames.shape
+        h_bar, w_bar = cls.smart_resize(h, w, factor, min_pixels, max_pixels)
+
+        resized = F.interpolate(
+            frames.float(),
+            size=(h_bar, w_bar),
+            mode="bilinear",
+            align_corners=False,
+        )
+        standardized = cls.standardize_batch(resized)
+
+        return standardized, w_bar, h_bar
+
+    @classmethod
+    def get_visual_transform(
+        cls,
+        img: torch.Tensor | Image.Image,
+        factor: int,
+        min_pixels: int,
+        max_pixels: int,
+        device: Optional[torch.device] = None,
+    ):
+        if isinstance(img, torch.Tensor):
+            img_tensor = img.float()
+            _, h, w = img_tensor.shape
+        elif isinstance(img, Image.Image):
+            img = img.convert("RGB")
+            w, h = img.size
+            img_array = np.array(img)
+            img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+        else:
+            raise TypeError(
+                f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image"
+            )
+
+        if device is not None:
+            img_tensor = img_tensor.to(device)
+
+        h_bar, w_bar = cls.smart_resize(h, w, factor, min_pixels, max_pixels)
+
+        img_resized = F.interpolate(
+            img_tensor.unsqueeze(0),
+            size=(h_bar, w_bar),
+            mode="bilinear",
+            align_corners=False,
+        )
+        img_standardized = cls.standardize_batch(img_resized).squeeze(0)
+
+        return img_standardized, w_bar, h_bar
+
+    @classmethod
+    def fetch_image(cls, image: Image.Image | str | bytes):
+        image_obj = None
+        if isinstance(image, Image.Image):
+            image_obj = image
+        elif isinstance(image, str):
+            if image.startswith("http://") or image.startswith("https://"):
+                with requests.get(image, stream=True) as response:
+                    response.raise_for_status()
+                    with BytesIO(response.content) as bio:
+                        image_obj = copy.deepcopy(Image.open(bio))
+            elif image.startswith("file://"):
+                image_obj = Image.open(image[7:])
+            elif image.startswith("data:image"):
+                if "base64," in image:
+                    _, base64_data = image.split("base64,", 1)
+                    data = base64.b64decode(base64_data)
+                    with BytesIO(data) as bio:
+                        image_obj = copy.deepcopy(Image.open(bio))
+            else:
+                image_obj = Image.open(image)
+        else:
+            image_obj = Image.open(BytesIO(image))
+        if image_obj is None:
+            raise ValueError(
+                f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
+            )
+        image = cls.to_rgb(image_obj)
+        return image
+
 
 class MiMoV2OmniProcessor(BaseMultimodalProcessor):
     models = [MiMoV2OmniForCausalLM]
-    use_image_processor_gpu = (
-        int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-    )
-
-    @staticmethod
-    def has_audio_track(path_or_data: str) -> bool:
-        try:
-            is_base64 = path_or_data.startswith("data:") and ";base64," in path_or_data
-            cmd = [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-select_streams",
-                "a",
-                "pipe:0" if is_base64 else path_or_data,
-            ]
-            inp = (
-                base64.b64decode(path_or_data.split(";base64,")[1])
-                if is_base64
-                else None
-            )
-            r = subprocess.run(cmd, input=inp, capture_output=True, timeout=30)
-            return bool(r.returncode == 0 and json.loads(r.stdout).get("streams"))
-        except Exception:
-            return False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -1410,10 +1389,10 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
 
         self.video_start_token_id = processor_config.get("video_start_token_id", None)
         self.video_end_token_id = processor_config.get("video_end_token_id", None)
-
+        self.use_image_processor_gpu = int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
         device = server_args.device if self.use_image_processor_gpu else None
 
-        self.mimo_processor = MiMoVLProcessor(
+        self.mimo_processor = MiMoOmniProcessor(
             tokenizer=self._processor.tokenizer,
             patch_size=patch_size,
             image_min_pixels=processor_config.get("image_min_pixels", None)
@@ -1493,32 +1472,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         video_tensor = video_tensor.permute(0, 3, 1, 2).float()
         timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
         return (video_tensor, timestamps)
-
-    @staticmethod
-    def _make_video_content(processed_video, use_audio, audio_source, preprocess_kwargs):
-        video_kwargs = {
-            k: preprocess_kwargs.get(k, None)
-            for k in (
-                "min_pixels",
-                "max_pixels",
-                "total_max_pixels",
-                "fps",
-                "num_frames",
-                "max_frames",
-                "min_frames",
-            )
-        }
-        if use_audio:
-            return Content(
-                type="video_audio",
-                content=VideoAudioInput(
-                    video=processed_video, audio=audio_source, **video_kwargs
-                ),
-            )
-        return Content(
-            type="video",
-            content=VideoInput(video=processed_video, **video_kwargs),
-        )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -1911,4 +1864,59 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             audio_end_id=self.AUDIO_END_TOKEN_ID,
             mrope_positions=input_sample.position_ids,
             mrope_position_delta=input_sample.rope_deltas,
+        )
+
+    # ------------------------------------------------------------------
+    # Static / class-level utility methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def has_audio_track(path_or_data: str) -> bool:
+        try:
+            is_base64 = path_or_data.startswith("data:") and ";base64," in path_or_data
+            cmd = [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "a",
+                "pipe:0" if is_base64 else path_or_data,
+            ]
+            inp = (
+                base64.b64decode(path_or_data.split(";base64,")[1])
+                if is_base64
+                else None
+            )
+            r = subprocess.run(cmd, input=inp, capture_output=True, timeout=30)
+            return bool(r.returncode == 0 and json.loads(r.stdout).get("streams"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _make_video_content(processed_video, use_audio, audio_source, preprocess_kwargs):
+        video_kwargs = {
+            k: preprocess_kwargs.get(k, None)
+            for k in (
+                "min_pixels",
+                "max_pixels",
+                "total_max_pixels",
+                "fps",
+                "num_frames",
+                "max_frames",
+                "min_frames",
+            )
+        }
+        if use_audio:
+            return Content(
+                type="video_audio",
+                content=VideoAudioInput(
+                    video=processed_video, audio=audio_source, **video_kwargs
+                ),
+            )
+        return Content(
+            type="video",
+            content=VideoInput(video=processed_video, **video_kwargs),
         )
