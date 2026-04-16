@@ -51,56 +51,6 @@ def _uniform_init(*shape: int):
     return t
 
 
-def _sample_vectors(samples, num: int):
-    num_samples, device = samples.shape[0], samples.device
-
-    if num_samples >= num:
-        indices = torch.randperm(num_samples, device=device)[:num]
-    else:
-        indices = torch.randint(0, num_samples, (num,), device=device)
-
-    selected_samples = samples[indices]
-
-    if dist.is_initialized():
-        dist.broadcast(selected_samples, src=0)
-
-    return selected_samples
-
-
-def _kmeans(samples, num_clusters: int, num_iters: int = 10):
-    dim, dtype = samples.shape[-1], samples.dtype
-
-    means = _sample_vectors(samples, num_clusters)
-
-    for _ in range(num_iters):
-        dists = -(
-            samples.pow(2).sum(1, keepdim=True)
-            - 2 * samples @ means.t()
-            + means.t().pow(2).sum(0, keepdim=True)
-        )
-
-        buckets = dists.max(dim=-1).indices
-        bins = torch.bincount(buckets, minlength=num_clusters)
-
-        new_means = buckets.new_zeros(num_clusters, dim, dtype=dtype)
-        new_means = new_means.scatter_add_(
-            0, repeat(buckets, "n -> n d", d=dim), samples
-        )
-
-        if dist.is_initialized():
-            dist.all_reduce(bins, op=dist.ReduceOp.SUM)
-            dist.all_reduce(new_means, op=dist.ReduceOp.SUM)
-
-        zero_mask = bins == 0
-        bins_min_clamped = bins.masked_fill(zero_mask, 1)
-
-        new_means = new_means / bins_min_clamped[..., None]
-
-        means = torch.where(zero_mask[..., None], means, new_means)
-
-    return means, bins
-
-
 def _rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -261,7 +211,6 @@ class EuclideanCodebook(nn.Module):
         threshold_ema_dead_code: int = 2,
     ):
         super().__init__()
-        self.decay = decay
         init_fn: tp.Union[tp.Callable[..., torch.Tensor], tp.Any] = (
             _uniform_init if not kmeans_init else torch.zeros
         )
@@ -269,25 +218,10 @@ class EuclideanCodebook(nn.Module):
 
         self.codebook_size = codebook_size
 
-        self.kmeans_iters = kmeans_iters
-        self.epsilon = epsilon
-        self.threshold_ema_dead_code = threshold_ema_dead_code
-
         self.register_buffer("inited", torch.Tensor([not kmeans_init]))
         self.register_buffer("cluster_size", torch.zeros(codebook_size))
         self.register_buffer("embed", embed)
         self.register_buffer("embed_avg", embed.clone())
-
-    @torch.jit.ignore
-    def init_embed_(self, data):
-        if self.inited.bool().item():
-            return
-
-        embed, cluster_size = _kmeans(data, self.codebook_size, self.kmeans_iters)
-        self.embed.data.copy_(embed)
-        self.embed_avg.data.copy_(embed.clone())
-        self.cluster_size.data.copy_(cluster_size)
-        self.inited.data.copy_(torch.Tensor([True]))
 
     def preprocess(self, x):
         x = rearrange(x, "... d -> (...) d")
@@ -320,19 +254,6 @@ class EuclideanCodebook(nn.Module):
     def decode(self, embed_ind):
         quantize = self.dequantize(embed_ind)
         return quantize
-
-    def forward(self, x):
-        shape, dtype = x.shape, x.dtype
-        x = self.preprocess(x)
-
-        self.init_embed_(x)
-
-        embed_ind = self.quantize(x)
-        embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
-        embed_ind = self.postprocess_emb(embed_ind, shape)
-        quantize = self.dequantize(embed_ind)
-
-        return quantize, embed_ind
 
 
 class VectorQuantization(nn.Module):
@@ -375,9 +296,6 @@ class VectorQuantization(nn.Module):
             nn.Linear(_codebook_dim, dim) if requires_projection else nn.Identity()
         )
 
-        self.epsilon = epsilon
-        self.commitment_weight = commitment_weight
-
         self._codebook = EuclideanCodebook(
             dim=_codebook_dim,
             codebook_size=codebook_size,
@@ -403,25 +321,6 @@ class VectorQuantization(nn.Module):
         quantize = self.project_out(quantize)
         return quantize
 
-    def forward(self, x):
-        device = x.device
-        x = self.project_in(x)
-
-        quantize, embed_ind = self._codebook(x)
-
-        if self.training:
-            quantize = x + (quantize - x).detach()
-
-        loss = torch.tensor([0.0], device=device, requires_grad=self.training)
-
-        if self.training:
-            if self.commitment_weight > 0:
-                commit_loss = F.mse_loss(quantize.detach(), x)
-                loss = loss + commit_loss * self.commitment_weight
-
-        quantize = self.project_out(quantize)
-        return quantize, embed_ind, loss
-
 
 class ResidualVectorQuantization(nn.Module):
     """Residual vector quantization implementation.
@@ -440,31 +339,6 @@ class ResidualVectorQuantization(nn.Module):
                 for i in range(num_quantizers)
             ]
         )
-
-    def forward(
-        self, x, n_q: tp.Optional[int] = None, layers: tp.Optional[list] = None
-    ):
-        quantized_out = 0.0
-        residual = x
-
-        all_losses = []
-        all_indices = []
-        out_quantized = []
-
-        n_q = n_q or len(self.layers)
-
-        for i, layer in enumerate(self.layers[:n_q]):
-            quantized, indices, loss = layer(residual)
-            residual = residual - quantized
-            quantized_out = quantized_out + quantized
-
-            all_indices.append(indices)
-            all_losses.append(loss)
-            if layers and i in layers:
-                out_quantized.append(quantized_out)
-
-        out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
-        return quantized_out, out_indices, out_losses, out_quantized
 
     def encode(
         self, x: torch.Tensor, n_q: tp.Optional[int] = None, st: tp.Optional[int] = None
@@ -531,18 +405,6 @@ class ResidualVectorQuantizer(nn.Module):
             kmeans_iters=self.kmeans_iters,
             threshold_ema_dead_code=self.threshold_ema_dead_code,
         )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        n_q: tp.Optional[int] = None,
-        layers: tp.Optional[list] = None,
-    ):
-        n_q = n_q if n_q else self.n_q
-        quantized, codes, commit_loss, quantized_list = self.vq(
-            x, n_q=n_q, layers=layers
-        )
-        return quantized, codes, torch.mean(commit_loss), quantized_list
 
     def encode(
         self, x: torch.Tensor, n_q: tp.Optional[int] = None, st: tp.Optional[int] = None
