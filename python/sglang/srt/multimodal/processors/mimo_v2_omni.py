@@ -23,6 +23,11 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
+from torchcodec.decoders import AudioDecoder
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+    Qwen2_5_VLVisionConfig,
+)
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -36,10 +41,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.utils import ImageData, VideoData
 from sglang.utils import logger
-from torchcodec.decoders import AudioDecoder
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
-    Qwen2_5_VLVisionConfig,
-)
 
 try:
     import decord
@@ -54,9 +55,12 @@ try:
     import torchaudio
     from torchaudio.transforms import MelSpectrogram
 except ImportError:
-    print("[Warning] torchaudio is not installed, audio inference will not be supported")
+    print(
+        "[Warning] torchaudio is not installed, audio inference will not be supported"
+    )
     torchaudio = None
     MelSpectrogram = None
+
 
 @dataclass
 class ImageInput:
@@ -66,7 +70,10 @@ class ImageInput:
 
     def __post_init__(self):
         if not isinstance(self.image, (Image.Image, str, bytes, torch.Tensor)):
-            raise ValueError(f"image must be a PIL.Image.Image, str, bytes, or torch.Tensor, but got {type(self.image)}")
+            raise ValueError(
+                f"image must be a PIL.Image.Image, str, bytes, or torch.Tensor, but got {type(self.image)}"
+            )
+
 
 @dataclass
 class VideoInput:
@@ -85,16 +92,32 @@ class VideoInput:
 
     def __post_init__(self):
         if not isinstance(self.video, (VideoReader, str, bytes, tuple)):
-            raise ValueError(f"video must be a str, bytes, or tuple, but got {type(self.video)}")
+            raise ValueError(
+                f"video must be a str, bytes, or tuple, but got {type(self.video)}"
+            )
         if isinstance(self.video, tuple):
             if len(self.video) != 2:
-                raise ValueError(f"video must be a tuple of 2 elements (pixels, timestamps), but got {len(self.video)} elements")
-            if not isinstance(self.video[0], torch.Tensor) or not isinstance(self.video[1], torch.Tensor):
-                raise ValueError(f"video must be a tuple of Tensors (pixels, timestamps), but got {type(self.video[0])} and {type(self.video[1])}")
-            if self.video[0].ndim != 4 or self.video[1].ndim != 1 or self.video[0].shape[0] != self.video[1].shape[0]:
-                raise ValueError(f"video must be a tuple of (pixels-TCHW, timestamps-T), but got {self.video[0].shape} and {self.video[1].shape}")
+                raise ValueError(
+                    f"video must be a tuple of 2 elements (pixels, timestamps), but got {len(self.video)} elements"
+                )
+            if not isinstance(self.video[0], torch.Tensor) or not isinstance(
+                self.video[1], torch.Tensor
+            ):
+                raise ValueError(
+                    f"video must be a tuple of Tensors (pixels, timestamps), but got {type(self.video[0])} and {type(self.video[1])}"
+                )
+            if (
+                self.video[0].ndim != 4
+                or self.video[1].ndim != 1
+                or self.video[0].shape[0] != self.video[1].shape[0]
+            ):
+                raise ValueError(
+                    f"video must be a tuple of (pixels-TCHW, timestamps-T), but got {self.video[0].shape} and {self.video[1].shape}"
+                )
         assert self.segment_type in ["individual", "partial"]
-        assert self.segment_type == "partial" or (self.start_time is None and self.end_time is None)
+        assert self.segment_type == "partial" or (
+            self.start_time is None and self.end_time is None
+        )
 
 
 @dataclass
@@ -105,20 +128,35 @@ class AudioInput:
     if audio is torch.Tensor, it is tokenized input ids with shape (T, n_vq+).
     if audio is np.ndarray, it is a pre-loaded waveform (1D, already resampled).
     """
+
     audio: str | bytes | tuple | torch.Tensor | np.ndarray
 
     def __post_init__(self):
         if not isinstance(self.audio, (str, bytes, tuple, torch.Tensor, np.ndarray)):
-            raise ValueError(f"audio must be a str, bytes, tuple, torch.Tensor, or np.ndarray, but got {type(self.audio)}")
+            raise ValueError(
+                f"audio must be a str, bytes, tuple, torch.Tensor, or np.ndarray, but got {type(self.audio)}"
+            )
         if isinstance(self.audio, tuple):
-            if len(self.audio) != 2 or not isinstance(self.audio[0], torch.Tensor) or not isinstance(self.audio[1], (int, float)):
-                raise ValueError(f"audio must be a tuple of (waveform-T, original_sr-int/float), but got {len(self.audio)} elements and {type(self.audio[0])} and {type(self.audio[1])}")
+            if (
+                len(self.audio) != 2
+                or not isinstance(self.audio[0], torch.Tensor)
+                or not isinstance(self.audio[1], (int, float))
+            ):
+                raise ValueError(
+                    f"audio must be a tuple of (waveform-T, original_sr-int/float), but got {len(self.audio)} elements and {type(self.audio[0])} and {type(self.audio[1])}"
+                )
             if self.audio[0].ndim != 1:
-                raise ValueError(f"waveform must be a 1D tensor, but got {self.audio[0].ndim}D tensor")
+                raise ValueError(
+                    f"waveform must be a 1D tensor, but got {self.audio[0].ndim}D tensor"
+                )
             if self.audio[1] <= 0:
-                raise ValueError(f"original_sr must be a positive number, but got {self.audio[1]}")
+                raise ValueError(
+                    f"original_sr must be a positive number, but got {self.audio[1]}"
+                )
         if isinstance(self.audio, torch.Tensor) and self.audio.ndim != 2:
-            raise ValueError(f"audio must be a 2D tensor, but got {self.audio.ndim}D tensor")
+            raise ValueError(
+                f"audio must be a 2D tensor, but got {self.audio.ndim}D tensor"
+            )
 
 
 @dataclass
@@ -139,24 +177,45 @@ class VideoAudioInput:
 
     def __post_init__(self):
         if not isinstance(self.video, (VideoReader, str, bytes, tuple)):
-            raise ValueError(f"video must be a str, bytes, or tuple, but got {type(self.video)}")
+            raise ValueError(
+                f"video must be a str, bytes, or tuple, but got {type(self.video)}"
+            )
         if isinstance(self.video, tuple):
             if len(self.video) != 2:
-                raise ValueError(f"video must be a tuple of 2 elements (pixels, timestamps), but got {len(self.video)} elements")
-            if not isinstance(self.video[0], torch.Tensor) or not isinstance(self.video[1], torch.Tensor):
-                raise ValueError(f"video must be a tuple of Tensors (pixels, timestamps), but got {type(self.video[0])} and {type(self.video[1])}")
-            if self.video[0].ndim != 4 or self.video[1].ndim != 1 or self.video[0].shape[0] != self.video[1].shape[0]:
-                raise ValueError(f"video must be a tuple of (pixels-TCHW, timestamps-T), but got {self.video[0].shape} and {self.video[1].shape}")
+                raise ValueError(
+                    f"video must be a tuple of 2 elements (pixels, timestamps), but got {len(self.video)} elements"
+                )
+            if not isinstance(self.video[0], torch.Tensor) or not isinstance(
+                self.video[1], torch.Tensor
+            ):
+                raise ValueError(
+                    f"video must be a tuple of Tensors (pixels, timestamps), but got {type(self.video[0])} and {type(self.video[1])}"
+                )
+            if (
+                self.video[0].ndim != 4
+                or self.video[1].ndim != 1
+                or self.video[0].shape[0] != self.video[1].shape[0]
+            ):
+                raise ValueError(
+                    f"video must be a tuple of (pixels-TCHW, timestamps-T), but got {self.video[0].shape} and {self.video[1].shape}"
+                )
         assert self.segment_type in ["individual", "partial"]
-        assert self.segment_type == "partial" or (self.start_time is None and self.end_time is None)
+        assert self.segment_type == "partial" or (
+            self.start_time is None and self.end_time is None
+        )
 
         if not isinstance(self.audio, (str, bytes, torch.Tensor)):
-            raise ValueError(f"audio must be a str, bytes, or torch.Tensor, but got {type(self.audio)}")
+            raise ValueError(
+                f"audio must be a str, bytes, or torch.Tensor, but got {type(self.audio)}"
+            )
         if isinstance(self.audio, torch.Tensor) and self.audio.ndim != 2:
-            raise ValueError(f"audio must be a 2D tensor, but got {self.audio.ndim}D tensor")
+            raise ValueError(
+                f"audio must be a 2D tensor, but got {self.audio.ndim}D tensor"
+            )
 
 
 TextInput = str | list[int]
+
 
 @dataclass
 class MiMoVLInputSample:
@@ -171,6 +230,7 @@ class MiMoVLInputSample:
     rope_deltas: Optional[torch.Tensor] = None
     extra: dict = field(default_factory=dict)
 
+
 @dataclass
 class Content:
     type: Literal["text", "image", "video", "audio", "video_audio"]
@@ -179,22 +239,38 @@ class Content:
 
     def __post_init__(self):
         if self.type not in ["text", "image", "video", "audio", "video_audio"]:
-            raise ValueError(f"type must be one of text, image, video, audio, video_audio, but got {self.type}")
+            raise ValueError(
+                f"type must be one of text, image, video, audio, video_audio, but got {self.type}"
+            )
         if self.type == "text":
-            if not isinstance(self.content, (str, list)) or (isinstance(self.content, list) and not all(isinstance(item, int) for item in self.content)):
-                raise ValueError(f"content must be a str or a list of ints, but got {type(self.content)}")
+            if not isinstance(self.content, (str, list)) or (
+                isinstance(self.content, list)
+                and not all(isinstance(item, int) for item in self.content)
+            ):
+                raise ValueError(
+                    f"content must be a str or a list of ints, but got {type(self.content)}"
+                )
         elif self.type == "image":
             if not isinstance(self.content, ImageInput):
-                raise ValueError(f"content must be a ImageInput, but got {type(self.content)}")
+                raise ValueError(
+                    f"content must be a ImageInput, but got {type(self.content)}"
+                )
         elif self.type == "video":
             if not isinstance(self.content, VideoInput):
-                raise ValueError(f"content must be a VideoInput, but got {type(self.content)}")
+                raise ValueError(
+                    f"content must be a VideoInput, but got {type(self.content)}"
+                )
         elif self.type == "audio":
             if not isinstance(self.content, AudioInput):
-                raise ValueError(f"content must be a AudioInput, but got {type(self.content)}")
+                raise ValueError(
+                    f"content must be a AudioInput, but got {type(self.content)}"
+                )
         elif self.type == "video_audio":
             if not isinstance(self.content, VideoAudioInput):
-                raise ValueError(f"content must be a VideoAudioInput, but got {type(self.content)}")
+                raise ValueError(
+                    f"content must be a VideoAudioInput, but got {type(self.content)}"
+                )
+
 
 QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
 QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
@@ -242,7 +318,7 @@ def smart_resize(
 
 
 def to_rgb(pil_image: Image.Image) -> Image.Image:
-    if pil_image.mode == 'RGBA':
+    if pil_image.mode == "RGBA":
         white_background = Image.new("RGB", pil_image.size, (255, 255, 255))
         white_background.paste(pil_image, mask=pil_image.split()[3])
         return white_background
@@ -277,7 +353,7 @@ def get_visual_transform_batch(
     resized = F.interpolate(
         frames.float(),
         size=(h_bar, w_bar),
-        mode='bilinear',
+        mode="bilinear",
         align_corners=False,
     )
     standardized = standardize_batch(resized)
@@ -286,12 +362,12 @@ def get_visual_transform_batch(
 
 
 def get_visual_transform(
-        img: torch.Tensor | Image.Image,
-        factor: int,
-        min_pixels: int,
-        max_pixels: int,
-        device: Optional[torch.device] = None,
-    ):
+    img: torch.Tensor | Image.Image,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
+    device: Optional[torch.device] = None,
+):
     if isinstance(img, torch.Tensor):
         img_tensor = img.float()
         _, h, w = img_tensor.shape
@@ -301,7 +377,9 @@ def get_visual_transform(
         img_array = np.array(img)
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
     else:
-        raise TypeError(f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image")
+        raise TypeError(
+            f"Unsupported image type: {type(img)}. Expected torch.Tensor or PIL.Image.Image"
+        )
 
     if device is not None:
         img_tensor = img_tensor.to(device)
@@ -311,7 +389,7 @@ def get_visual_transform(
     img_resized = F.interpolate(
         img_tensor.unsqueeze(0),
         size=(h_bar, w_bar),
-        mode='bilinear',
+        mode="bilinear",
         align_corners=False,
     )
     img_standardized = standardize_batch(img_resized).squeeze(0)
@@ -344,72 +422,64 @@ def fetch_image(
     else:
         image_obj = Image.open(BytesIO(image))
     if image_obj is None:
-        raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
+        raise ValueError(
+            f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
+        )
     image = to_rgb(image_obj)
     return image
 
 
 class MiMoVLProcessor:
     def __init__(
-            self,
-            tokenizer,
-            patch_size=14,
-            merge_size=2,
-            temporal_patch_size=2,
-            temporal_compression_ratio=1,
-
-            video_tokens_per_second=2,
-            use_video_timestamps=False,
-            video_audio_interleave_length=0,
-            use_per_grid_t_timestamps=True,
-
-            audio_kernel_size=3,
-            audio_stride_size=2,
-            audio_avg_pooler=2,
-
-            audio_sampling_rate=24000,
-            audio_nfft=960,
-            audio_hop_length=240,
-            audio_window_size=960,
-            audio_fmin=0,
-            audio_fmax=None,
-            audio_n_mels=128,
-
-            audio_segment_size=6000,
-
-            audio_channels=8,
-            audio_group_size=4,
-            audio_input_id_per_second=25,
-            audio_zeroemb_idx=4096,
-
-            image_min_pixels=None,
-            image_max_pixels=None,
-            video_min_pixels=None,
-            video_max_pixels=None,
-            video_total_max_pixels=None,
-            fps=None,
-            num_frames=None,
-            max_frames=None,
-            min_frames=None,
-
-            image_token_id=None,
-            video_token_id=None,
-            audio_token_id=None,
-            vision_start_token_id=None,
-            vision_end_token_id=None,
-            audio_start_token_id=None,
-            audio_end_token_id=None,
-            video_start_token_id=None,
-            video_end_token_id=None,
-            pad_token_id=None,
-
-            rope_type="rope",
-
-            video_process_num_threads=16,
-            device=None,
-
-            **kwargs
-        ):
+        self,
+        tokenizer,
+        patch_size=14,
+        merge_size=2,
+        temporal_patch_size=2,
+        temporal_compression_ratio=1,
+        video_tokens_per_second=2,
+        use_video_timestamps=False,
+        video_audio_interleave_length=0,
+        use_per_grid_t_timestamps=True,
+        audio_kernel_size=3,
+        audio_stride_size=2,
+        audio_avg_pooler=2,
+        audio_sampling_rate=24000,
+        audio_nfft=960,
+        audio_hop_length=240,
+        audio_window_size=960,
+        audio_fmin=0,
+        audio_fmax=None,
+        audio_n_mels=128,
+        audio_segment_size=6000,
+        audio_channels=8,
+        audio_group_size=4,
+        audio_input_id_per_second=25,
+        audio_zeroemb_idx=4096,
+        image_min_pixels=None,
+        image_max_pixels=None,
+        video_min_pixels=None,
+        video_max_pixels=None,
+        video_total_max_pixels=None,
+        fps=None,
+        num_frames=None,
+        max_frames=None,
+        min_frames=None,
+        image_token_id=None,
+        video_token_id=None,
+        audio_token_id=None,
+        vision_start_token_id=None,
+        vision_end_token_id=None,
+        audio_start_token_id=None,
+        audio_end_token_id=None,
+        video_start_token_id=None,
+        video_end_token_id=None,
+        pad_token_id=None,
+        rope_type="rope",
+        video_process_num_threads=16,
+        device=None,
+        **kwargs,
+    ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
 
@@ -425,11 +495,18 @@ class MiMoVLProcessor:
 
         self.use_video_timestamps = use_video_timestamps
         assert self.use_video_timestamps
-        assert not self.use_video_timestamps or self.rope_type == "rope", "use_video_timestamps only supports 1d rope"
+        assert (
+            not self.use_video_timestamps or self.rope_type == "rope"
+        ), "use_video_timestamps only supports 1d rope"
         self.video_audio_interleave_length = video_audio_interleave_length
         self.use_per_grid_t_timestamps = False
-        assert self.video_audio_interleave_length == -1 or self.rope_type == "rope", "video_audio_interleave_length != -1 only supports 1d rope"
-        assert self.video_audio_interleave_length == -1 or self.video_audio_interleave_length >= 0
+        assert (
+            self.video_audio_interleave_length == -1 or self.rope_type == "rope"
+        ), "video_audio_interleave_length != -1 only supports 1d rope"
+        assert (
+            self.video_audio_interleave_length == -1
+            or self.video_audio_interleave_length >= 0
+        )
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
@@ -482,16 +559,26 @@ class MiMoVLProcessor:
         self.audio_group_size = audio_group_size
         self.audio_input_id_per_second = audio_input_id_per_second
         if isinstance(audio_zeroemb_idx, int):
-            self.audio_zeroemb_idxs = torch.tensor([audio_zeroemb_idx] * self.audio_channels, dtype=torch.int32)
+            self.audio_zeroemb_idxs = torch.tensor(
+                [audio_zeroemb_idx] * self.audio_channels, dtype=torch.int32
+            )
         elif isinstance(audio_zeroemb_idx, list):
             if len(audio_zeroemb_idx) == 1:
-                self.audio_zeroemb_idxs = torch.tensor(audio_zeroemb_idx * self.audio_channels, dtype=torch.int32)
+                self.audio_zeroemb_idxs = torch.tensor(
+                    audio_zeroemb_idx * self.audio_channels, dtype=torch.int32
+                )
             elif len(audio_zeroemb_idx) == self.audio_channels:
-                self.audio_zeroemb_idxs = torch.tensor(audio_zeroemb_idx, dtype=torch.int32)
+                self.audio_zeroemb_idxs = torch.tensor(
+                    audio_zeroemb_idx, dtype=torch.int32
+                )
             else:
-                raise ValueError(f"audio_zeroemb_idx must be a list of 1 or {self.audio_channels} integers, but got {len(audio_zeroemb_idx)}")
+                raise ValueError(
+                    f"audio_zeroemb_idx must be a list of 1 or {self.audio_channels} integers, but got {len(audio_zeroemb_idx)}"
+                )
         else:
-            raise ValueError(f"audio_zeroemb_idx must be an integer or a list of {self.audio_channels} integers, but got {type(audio_zeroemb_idx)}")
+            raise ValueError(
+                f"audio_zeroemb_idx must be an integer or a list of {self.audio_channels} integers, but got {type(audio_zeroemb_idx)}"
+            )
 
         assert image_min_pixels is not None
         assert image_max_pixels is not None
@@ -568,7 +655,9 @@ class MiMoVLProcessor:
             - mel spectrogram: torch.Tensor (T, n_mels)
             - number of tokens: int
         """
-        assert isinstance(audio, (str, bytes, tuple)), f"audio must be a str, bytes or tuple, but got {type(audio)}"
+        assert isinstance(
+            audio, (str, bytes, tuple)
+        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
         if isinstance(audio, tuple):
             waveform, original_sr = audio
         else:
@@ -576,12 +665,16 @@ class MiMoVLProcessor:
                 file = io.BytesIO(audio)
             elif isinstance(audio, str):
                 if audio.startswith("data:"):
-                    file = io.BytesIO(pybase64.b64decode(audio.split(",")[1], validate=True))
+                    file = io.BytesIO(
+                        pybase64.b64decode(audio.split(",")[1], validate=True)
+                    )
                 elif audio.startswith("http://") or audio.startswith("https://"):
                     dl_start = time.perf_counter()
                     timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                     try:
-                        response = self.http_session.get(audio, stream=True, timeout=timeout)
+                        response = self.http_session.get(
+                            audio, stream=True, timeout=timeout
+                        )
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         if dl_elapsed_ms > 1000.0:
                             content_len = len(response.content)
@@ -603,10 +696,13 @@ class MiMoVLProcessor:
             try:
                 samples = AudioDecoder(file).get_all_samples()
             except RuntimeError as e:
-                audio_source = audio if isinstance(audio, str) and (audio.startswith("http://") or audio.startswith("https://")) else "<bytes or base64>"
-                logger.error(
-                    f"Failed to decode audio: {e}, source={audio_source}"
+                audio_source = (
+                    audio
+                    if isinstance(audio, str)
+                    and (audio.startswith("http://") or audio.startswith("https://"))
+                    else "<bytes or base64>"
                 )
+                logger.error(f"Failed to decode audio: {e}, source={audio_source}")
                 raise ValueError(
                     f"Invalid audio format: source={audio_source}, detail={e}"
                 ) from e
@@ -630,8 +726,12 @@ class MiMoVLProcessor:
         spec = spec.transpose(0, 1)
 
         audio_token_len = spec.shape[0] + 3 - self.audio_kernel_size
-        audio_token_len = (audio_token_len + 2 - self.audio_kernel_size) // self.audio_stride_size + 1
-        audio_token_len = audio_token_len // self.audio_avg_pooler + int(audio_token_len % self.audio_avg_pooler != 0)
+        audio_token_len = (
+            audio_token_len + 2 - self.audio_kernel_size
+        ) // self.audio_stride_size + 1
+        audio_token_len = audio_token_len // self.audio_avg_pooler + int(
+            audio_token_len % self.audio_avg_pooler != 0
+        )
         audio_token_len = math.ceil(audio_token_len / self.audio_group_size)
 
         return spec, audio_token_len
@@ -643,17 +743,26 @@ class MiMoVLProcessor:
             image = fetch_image(image)
         image_transformed_tensor, _, _ = get_visual_transform(
             image,
-            factor=self.patch_size*self.merge_size,
+            factor=self.patch_size * self.merge_size,
             min_pixels=kwargs["min_pixels"],
             max_pixels=kwargs["max_pixels"],
             device=self.device,
         )
         return image_transformed_tensor
 
-    def process_video(self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None):
+    def process_video(
+        self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None
+    ):
 
-        def smart_resize_video(num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs):
-            max_pixels_per_frame = total_max_pixels * self.temporal_patch_size * self.temporal_compression_ratio // num_total_frames
+        def smart_resize_video(
+            num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs
+        ):
+            max_pixels_per_frame = (
+                total_max_pixels
+                * self.temporal_patch_size
+                * self.temporal_compression_ratio
+                // num_total_frames
+            )
             max_pixels = max(min_pixels, min(max_pixels_per_frame, max_pixels))
             return min_pixels, max_pixels
 
@@ -671,11 +780,15 @@ class MiMoVLProcessor:
                 if len(left_indices) > 0:
                     selected_frame_indices = left_indices[-1:].clone()
                 else:
-                    raise ValueError(f"No frames before start_time {start_time} in all_timestamps {all_timestamps.tolist()}")
+                    raise ValueError(
+                        f"No frames before start_time {start_time} in all_timestamps {all_timestamps.tolist()}"
+                    )
             else:
                 selected_frame_indices = candidate_indices
 
-            assert len(selected_frame_indices) > 0, f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
+            assert (
+                len(selected_frame_indices) > 0
+            ), f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
             return selected_frame_indices
 
         kwargs = self.prepare_video_kwargs(video_input)
@@ -689,14 +802,24 @@ class MiMoVLProcessor:
 
         video_tensor, timestamps_sampled = video
         if len(timestamps_sampled) < 2:
-            logger.info("[Warning] Less than two frames are sampled, using default fps (1 fps)")
+            logger.info(
+                "[Warning] Less than two frames are sampled, using default fps (1 fps)"
+            )
             fps_sampled = 1
         else:
             fps_sampled = 1 / (timestamps_sampled[1] - timestamps_sampled[0])
         num_frames_sampled = video_tensor.shape[0]
 
-        start_time = video_input.start_time if video_input.start_time is not None else timestamps_sampled[0]
-        end_time = video_input.end_time if video_input.end_time is not None else timestamps_sampled[-1] + (1 / fps_sampled)
+        start_time = (
+            video_input.start_time
+            if video_input.start_time is not None
+            else timestamps_sampled[0]
+        )
+        end_time = (
+            video_input.end_time
+            if video_input.end_time is not None
+            else timestamps_sampled[-1] + (1 / fps_sampled)
+        )
 
         if video_input.segment_type == "individual":
             start_time_seg = start_time
@@ -705,13 +828,23 @@ class MiMoVLProcessor:
             frames = video_tensor
             num_frames_seg = num_frames_sampled
         else:
-            selected_indices = segment_frame_selector(timestamps_sampled, start_time, end_time)
+            selected_indices = segment_frame_selector(
+                timestamps_sampled, start_time, end_time
+            )
 
             timestamps_seg = timestamps_sampled[selected_indices]
             frames = video_tensor[selected_indices]
             num_frames_seg = len(timestamps_seg)
-            start_time_seg = timestamps_seg[0].item() if isinstance(timestamps_seg[0], torch.Tensor) else timestamps_seg[0]
-            end_time_seg = (timestamps_seg[-1].item() if isinstance(timestamps_seg[-1], torch.Tensor) else timestamps_seg[-1]) + (1 / fps_sampled).item()
+            start_time_seg = (
+                timestamps_seg[0].item()
+                if isinstance(timestamps_seg[0], torch.Tensor)
+                else timestamps_seg[0]
+            )
+            end_time_seg = (
+                timestamps_seg[-1].item()
+                if isinstance(timestamps_seg[-1], torch.Tensor)
+                else timestamps_seg[-1]
+            ) + (1 / fps_sampled).item()
 
         video_meta = {
             "fps_sampled": fps_sampled,
@@ -721,28 +854,47 @@ class MiMoVLProcessor:
 
         min_pixels, max_pixels = smart_resize_video(num_frames_sampled, **kwargs)
 
-        assert num_frames_seg > 0, f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
+        assert (
+            num_frames_seg > 0
+        ), f"Sampled frame number must be >0. start_time {video_input.start_time}, end_time {video_input.end_time}, start_time_seg {start_time_seg}, end_time_seg {end_time_seg}. Full timestamps {timestamps_sampled.tolist()}. "
 
-        temporal_padding_factor = self.temporal_patch_size * self.temporal_compression_ratio if temporal_padding_factor is None else temporal_padding_factor
+        temporal_padding_factor = (
+            self.temporal_patch_size * self.temporal_compression_ratio
+            if temporal_padding_factor is None
+            else temporal_padding_factor
+        )
 
         if num_frames_seg % temporal_padding_factor == 0:
             aligned_frames = frames
             aligned_timestamps = timestamps_seg
         else:
-            aligned_num_frames = ((num_frames_seg + temporal_padding_factor - 1) // temporal_padding_factor) * temporal_padding_factor
+            aligned_num_frames = (
+                (num_frames_seg + temporal_padding_factor - 1)
+                // temporal_padding_factor
+            ) * temporal_padding_factor
             num_frames_needed = aligned_num_frames - num_frames_seg
-            aligned_frames = torch.cat([frames, frames[-1:].repeat(num_frames_needed, *[1]*(frames.ndim-1))], dim=0)
-            aligned_timestamps = torch.cat([timestamps_seg, timestamps_seg[-1:].repeat(num_frames_needed)], dim=0)
+            aligned_frames = torch.cat(
+                [
+                    frames,
+                    frames[-1:].repeat(num_frames_needed, *[1] * (frames.ndim - 1)),
+                ],
+                dim=0,
+            )
+            aligned_timestamps = torch.cat(
+                [timestamps_seg, timestamps_seg[-1:].repeat(num_frames_needed)], dim=0
+            )
 
         video_transformed_tensor, _, _ = get_visual_transform_batch(
             aligned_frames,
-            factor=self.patch_size*self.merge_size,
+            factor=self.patch_size * self.merge_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             device=self.device,
         )
 
-        visual_patches, thw_grid = self._flatten_visual_inputs(video_transformed_tensor, "video")
+        visual_patches, thw_grid = self._flatten_visual_inputs(
+            video_transformed_tensor, "video"
+        )
         return visual_patches, thw_grid, aligned_timestamps, video_meta
 
     def process_audio(self, audio: AudioInput):
@@ -754,12 +906,29 @@ class MiMoVLProcessor:
             audio_spec, audio_token_len = self.preprocess_audio(audio)
             return audio_spec, audio_token_len
 
-        assert audio.shape[1] >= self.audio_channels, f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
+        assert (
+            audio.shape[1] >= self.audio_channels
+        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
         T = audio.shape[0]
-        audio = audio[:,:self.audio_channels].to(torch.long)
-        padded_T = (T + self.audio_group_size - 1) // self.audio_group_size * self.audio_group_size
-        padded_audio = torch.cat([audio, torch.zeros(padded_T - T, self.audio_channels, dtype=torch.long) + audio[-1, :]], dim=0)
-        padded_audio = padded_audio.reshape(padded_T // self.audio_group_size, self.audio_group_size, self.audio_channels)
+        audio = audio[:, : self.audio_channels].to(torch.long)
+        padded_T = (
+            (T + self.audio_group_size - 1)
+            // self.audio_group_size
+            * self.audio_group_size
+        )
+        padded_audio = torch.cat(
+            [
+                audio,
+                torch.zeros(padded_T - T, self.audio_channels, dtype=torch.long)
+                + audio[-1, :],
+            ],
+            dim=0,
+        )
+        padded_audio = padded_audio.reshape(
+            padded_T // self.audio_group_size,
+            self.audio_group_size,
+            self.audio_channels,
+        )
         return padded_audio
 
     def process(self, contents: list[Content], verbose: bool = False):
@@ -793,7 +962,9 @@ class MiMoVLProcessor:
                         try:
                             video_results[idx] = future.result()
                         except Exception as e:
-                            raise RuntimeError(f"Error processing video at index {idx}: {e}") from e
+                            raise RuntimeError(
+                                f"Error processing video at index {idx}: {e}"
+                            ) from e
             else:
                 for idx, video_input, _ in video_contents_info:
                     video_results[idx] = self.process_video(video_input)
@@ -812,39 +983,69 @@ class MiMoVLProcessor:
                     if isinstance(content.content, str):
                         verbose_str += f"Text: [{content.content}]\n"
                     else:
-                        verbose_str += f"Text: [{self.tokenizer.decode(content.content)}]\n"
+                        verbose_str += (
+                            f"Text: [{self.tokenizer.decode(content.content)}]\n"
+                        )
             elif content.type == "image":
                 image_tensor = self.process_image(content.content)
-                visual_patches, thw_grid = self._flatten_visual_inputs(image_tensor, "image")
+                visual_patches, thw_grid = self._flatten_visual_inputs(
+                    image_tensor, "image"
+                )
                 grid_t, grid_h, grid_w = thw_grid
-                num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size ** 2)
+                num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size**2)
                 image_pixel_values.append(visual_patches)
                 image_thw_grids.append(thw_grid)
-                _input_ids = [self.vision_start_token_id] + [self.image_token_id] * num_media_tokens + [self.vision_end_token_id]
+                _input_ids = (
+                    [self.vision_start_token_id]
+                    + [self.image_token_id] * num_media_tokens
+                    + [self.vision_end_token_id]
+                )
 
                 if verbose:
                     verbose_str += f"Image (shape={image_tensor.shape}, image_thw_grid={thw_grid}): [<vision_start> {num_media_tokens}*<vision> <vision_end>]\n"
 
             elif content.type == "video":
-                visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
+                visual_patches, thw_grid, timestamps, video_meta = video_results[
+                    content_idx
+                ]
                 grid_t, grid_h, grid_w = thw_grid
-                num_media_tokens = (grid_t * grid_h * grid_w) // (self.merge_size ** 2) // self.temporal_compression_ratio
+                num_media_tokens = (
+                    (grid_t * grid_h * grid_w)
+                    // (self.merge_size**2)
+                    // self.temporal_compression_ratio
+                )
                 video_pixel_values.append(visual_patches)
                 video_thw_grids.append(thw_grid)
 
-                assert len(timestamps) == grid_t * self.temporal_patch_size, f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
+                assert (
+                    len(timestamps) == grid_t * self.temporal_patch_size
+                ), f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"
 
                 if self.use_video_timestamps:
-                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size ** 2)
-                    text_timestamps = [format_timestamp(ts) for ts in timestamps[::self.temporal_patch_size*self.temporal_compression_ratio]]
-                    text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
-                    _input_ids = ([self.video_start_token_id] +
-                        sum([
-                            ts_ids +
-                            [self.vision_start_token_id] +
-                            [self.video_token_id] * num_media_tokens_per_grid +
-                            [self.vision_end_token_id] for ts_ids in text_timestamp_ids], []) +
-                        [self.video_end_token_id]
+                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+                    text_timestamps = [
+                        format_timestamp(ts)
+                        for ts in timestamps[
+                            :: self.temporal_patch_size
+                            * self.temporal_compression_ratio
+                        ]
+                    ]
+                    text_timestamp_ids = [
+                        self.tokenizer.encode(ts) for ts in text_timestamps
+                    ]
+                    _input_ids = (
+                        [self.video_start_token_id]
+                        + sum(
+                            [
+                                ts_ids
+                                + [self.vision_start_token_id]
+                                + [self.video_token_id] * num_media_tokens_per_grid
+                                + [self.vision_end_token_id]
+                                for ts_ids in text_timestamp_ids
+                            ],
+                            [],
+                        )
+                        + [self.video_end_token_id]
                     )
                     if verbose:
                         verbose_str += f"Video (video_thw_grid={thw_grid}, video_meta={video_meta}): [<video_start> "
@@ -855,7 +1056,9 @@ class MiMoVLProcessor:
                 else:
                     raise NotImplementedError
 
-                second_per_grid_ts.append(self.temporal_patch_size / video_meta['fps_sampled'])
+                second_per_grid_ts.append(
+                    self.temporal_patch_size / video_meta["fps_sampled"]
+                )
             elif content.type == "audio":
                 audio = content.content
                 processed_audio = self.process_audio(audio)
@@ -867,17 +1070,27 @@ class MiMoVLProcessor:
                     audio_inputs.append(processed_audio)
                     audio_token_len = processed_audio.shape[0]
                     is_audio_tokenized.append(True)
-                _input_ids = [self.audio_start_token_id] + [self.audio_token_id] * audio_token_len + [self.audio_end_token_id]
+                _input_ids = (
+                    [self.audio_start_token_id]
+                    + [self.audio_token_id] * audio_token_len
+                    + [self.audio_end_token_id]
+                )
 
                 if verbose:
                     verbose_str += f"Audio (is_tokenized={is_audio_tokenized[-1]}): [<audio_start> {audio_token_len}*<audio> <audio_end>]\n"
 
             elif content.type == "video_audio":
-                visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
-                second_per_grid_ts.append(self.temporal_patch_size / video_meta['fps_sampled'])
+                visual_patches, thw_grid, timestamps, video_meta = video_results[
+                    content_idx
+                ]
+                second_per_grid_ts.append(
+                    self.temporal_patch_size / video_meta["fps_sampled"]
+                )
 
                 processed_audio = self.process_audio(content.content)
-                audio_token_per_second = self.audio_input_id_per_second / self.audio_group_size
+                audio_token_per_second = (
+                    self.audio_input_id_per_second / self.audio_group_size
+                )
 
                 grid_t, grid_h, grid_w = thw_grid
                 video_pixel_values.append(visual_patches)
@@ -885,7 +1098,10 @@ class MiMoVLProcessor:
 
                 if self.use_video_timestamps:
                     if isinstance(processed_audio, tuple):
-                        assert content.content.start_time is None and content.content.end_time is None, "Audio start_time and end_time must be None when audio is not tokenized"
+                        assert (
+                            content.content.start_time is None
+                            and content.content.end_time is None
+                        ), "Audio start_time and end_time must be None when audio is not tokenized"
                         is_audio_tokenized.append(False)
                         audio_spec, audio_token_len = processed_audio
                         audio_inputs.append(audio_spec)
@@ -895,23 +1111,54 @@ class MiMoVLProcessor:
 
                     video_audio_units = []
 
-                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size ** 2)
-                    grid_t_timestamps = timestamps[::self.temporal_patch_size*self.temporal_compression_ratio]
+                    num_media_tokens_per_grid = grid_h * grid_w // (self.merge_size**2)
+                    grid_t_timestamps = timestamps[
+                        :: self.temporal_patch_size * self.temporal_compression_ratio
+                    ]
                     text_timestamps = [format_timestamp(ts) for ts in grid_t_timestamps]
-                    text_timestamp_ids = [self.tokenizer.encode(ts) for ts in text_timestamps]
+                    text_timestamp_ids = [
+                        self.tokenizer.encode(ts) for ts in text_timestamps
+                    ]
 
                     for i in range(len(grid_t_timestamps)):
                         timestamp = grid_t_timestamps[i]
                         timestamp_text = text_timestamps[i]
                         timestamp_ids = text_timestamp_ids[i]
 
-                        audio_start_token_idx = int(grid_t_timestamps[i] * audio_token_per_second)
-                        audio_end_token_idx = int(grid_t_timestamps[i+1] * audio_token_per_second) if i < len(grid_t_timestamps) - 1 else int(video_meta["segment_end_time"] * audio_token_per_second)
+                        audio_start_token_idx = int(
+                            grid_t_timestamps[i] * audio_token_per_second
+                        )
+                        audio_end_token_idx = (
+                            int(grid_t_timestamps[i + 1] * audio_token_per_second)
+                            if i < len(grid_t_timestamps) - 1
+                            else int(
+                                video_meta["segment_end_time"] * audio_token_per_second
+                            )
+                        )
 
-                        segment_audio_token_len = min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
+                        segment_audio_token_len = (
+                            min(audio_end_token_idx, audio_token_len)
+                            - audio_start_token_idx
+                        )
                         assert segment_audio_token_len > 0
-                        segment_audio = processed_audio[audio_start_token_idx:audio_start_token_idx+segment_audio_token_len] if is_audio_tokenized[-1] else None
-                        video_audio_units.append((timestamp, timestamp_text, timestamp_ids, num_media_tokens_per_grid, segment_audio_token_len, segment_audio))
+                        segment_audio = (
+                            processed_audio[
+                                audio_start_token_idx : audio_start_token_idx
+                                + segment_audio_token_len
+                            ]
+                            if is_audio_tokenized[-1]
+                            else None
+                        )
+                        video_audio_units.append(
+                            (
+                                timestamp,
+                                timestamp_text,
+                                timestamp_ids,
+                                num_media_tokens_per_grid,
+                                segment_audio_token_len,
+                                segment_audio,
+                            )
+                        )
 
                     if self.video_audio_interleave_length == -1:
                         groups = [[(i, u) for i, u in enumerate(video_audio_units)]]
@@ -924,8 +1171,15 @@ class MiMoVLProcessor:
                         current_group = []
                         time_ptr = 0
                         while unit_idx < len(video_audio_units):
-                            while unit_idx < len(video_audio_units) and video_audio_units[unit_idx][0] >= time_ptr and video_audio_units[unit_idx][0] < time_ptr + self.video_audio_interleave_length:
-                                current_group.append((unit_idx, video_audio_units[unit_idx]))
+                            while (
+                                unit_idx < len(video_audio_units)
+                                and video_audio_units[unit_idx][0] >= time_ptr
+                                and video_audio_units[unit_idx][0]
+                                < time_ptr + self.video_audio_interleave_length
+                            ):
+                                current_group.append(
+                                    (unit_idx, video_audio_units[unit_idx])
+                                )
                                 unit_idx += 1
                             if len(current_group) > 0:
                                 groups.append(current_group)
@@ -933,31 +1187,53 @@ class MiMoVLProcessor:
                             time_ptr += self.video_audio_interleave_length
 
                     _input_ids = [self.video_start_token_id]
-                    if verbose: verbose_str += f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, is_audio_tokenized={is_audio_tokenized[-1]}, audio_token_len={audio_token_len}): [<video_start> "
+                    if verbose:
+                        verbose_str += f"VideoAudio (video_thw_grid={thw_grid}, video_meta={video_meta}, is_audio_tokenized={is_audio_tokenized[-1]}, audio_token_len={audio_token_len}): [<video_start> "
                     for group in groups:
                         if not self.use_per_grid_t_timestamps:
                             _input_ids += group[0][1][2]
-                            if verbose: verbose_str += f"{group[0][1][1]} "
+                            if verbose:
+                                verbose_str += f"{group[0][1][1]} "
                         _video_tokens, _audio_tokens = [], []
                         video_verbose_str, audio_verbose_str = "", ""
                         for unit_idx, unit in group:
-                            timestamp, timestamp_text, timestamp_ids, video_token_len, segment_audio_token_len, segment_audio = unit
+                            (
+                                timestamp,
+                                timestamp_text,
+                                timestamp_ids,
+                                video_token_len,
+                                segment_audio_token_len,
+                                segment_audio,
+                            ) = unit
                             if self.use_per_grid_t_timestamps:
                                 _video_tokens += timestamp_ids
                                 _audio_tokens += timestamp_ids
                                 video_verbose_str += timestamp_text + " "
                                 audio_verbose_str += timestamp_text + " "
-                            _video_tokens += [self.vision_start_token_id] + [self.video_token_id] * video_token_len + [self.vision_end_token_id]
+                            _video_tokens += (
+                                [self.vision_start_token_id]
+                                + [self.video_token_id] * video_token_len
+                                + [self.vision_end_token_id]
+                            )
                             video_verbose_str += f"[{','.join([f'{ts:.2f}' for ts in timestamps.tolist()[unit_idx*self.temporal_patch_size*self.temporal_compression_ratio : (unit_idx+1)*self.temporal_patch_size*self.temporal_compression_ratio]])}] <vision_start> {video_token_len}*<video> <vision_end> "
-                            _audio_tokens += [self.audio_token_id] * segment_audio_token_len
+                            _audio_tokens += [
+                                self.audio_token_id
+                            ] * segment_audio_token_len
                             audio_verbose_str += f"{segment_audio_token_len}*<audio> "
                             if segment_audio is not None:
                                 audio_inputs.append(segment_audio)
 
-                        _input_ids += _video_tokens + [self.audio_start_token_id] + _audio_tokens + [self.audio_end_token_id]
-                        if verbose: verbose_str += f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
+                        _input_ids += (
+                            _video_tokens
+                            + [self.audio_start_token_id]
+                            + _audio_tokens
+                            + [self.audio_end_token_id]
+                        )
+                        if verbose:
+                            verbose_str += f"{video_verbose_str}<audio_start> {audio_verbose_str}<audio_end> "
                     _input_ids += [self.video_end_token_id]
-                    if verbose: verbose_str += "<video_end>]\n"
+                    if verbose:
+                        verbose_str += "<video_end>]\n"
 
                 else:
                     raise NotImplementedError
@@ -971,7 +1247,9 @@ class MiMoVLProcessor:
         labels = torch.tensor(labels)
 
         if len(is_audio_tokenized) > 0:
-            assert all(is_audio_tokenized) or not any(is_audio_tokenized), "All audio inputs must be tokenized or not tokenized"
+            assert all(is_audio_tokenized) or not any(
+                is_audio_tokenized
+            ), "All audio inputs must be tokenized or not tokenized"
             extra["is_audio_tokenized"] = is_audio_tokenized[0]
 
         if self.rope_type == "rope":
@@ -979,6 +1257,7 @@ class MiMoVLProcessor:
             rope_deltas = torch.zeros((1, 1), dtype=torch.int32)
         elif self.rope_type == "mrope":
             from .rope_utils import get_rope_index
+
             position_ids, rope_deltas = get_rope_index(
                 spatial_merge_size=self.merge_size,
                 image_token_id=self.image_token_id,
@@ -1006,16 +1285,19 @@ class MiMoVLProcessor:
             audio_inputs=audio_inputs,
             position_ids=position_ids,
             rope_deltas=rope_deltas,
-            extra=extra
+            extra=extra,
         )
 
-
     def _flatten_visual_inputs(self, visual: torch.Tensor, visual_type: str):
-        if visual_type == 'image':
+        if visual_type == "image":
             resized_height, resized_width = visual.shape[-2:]
             patches = visual.unsqueeze(0).repeat(self.temporal_patch_size, 1, 1, 1)
-        elif visual_type == 'video' or visual_type == 'video_audio':
-            assert len(visual) % (self.temporal_compression_ratio * self.temporal_patch_size) == 0
+        elif visual_type == "video" or visual_type == "video_audio":
+            assert (
+                len(visual)
+                % (self.temporal_compression_ratio * self.temporal_patch_size)
+                == 0
+            )
             patches = visual
             resized_height, resized_width = patches.shape[-2:]
         else:
@@ -1023,7 +1305,10 @@ class MiMoVLProcessor:
 
         channel = patches.shape[1]
         grid_t = patches.shape[0] // self.temporal_patch_size
-        grid_h, grid_w = resized_height // self.patch_size, resized_width // self.patch_size
+        grid_h, grid_w = (
+            resized_height // self.patch_size,
+            resized_width // self.patch_size,
+        )
         patches = patches.contiguous().view(
             grid_t,
             self.temporal_patch_size,
@@ -1691,7 +1976,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             mm_items.append(
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
-                    feature=torch.cat([v.cpu() for v in input_sample.pixel_values], dim=0),
+                    feature=torch.cat(
+                        [v.cpu() for v in input_sample.pixel_values], dim=0
+                    ),
                     model_specific_data={
                         "image_grid_thw": torch.stack(input_sample.image_thw_grids)
                     },
@@ -1705,7 +1992,9 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             mm_items.append(
                 MultimodalDataItem(
                     modality=Modality.VIDEO,
-                    feature=torch.cat([v.cpu() for v in input_sample.pixel_values_videos], dim=0),
+                    feature=torch.cat(
+                        [v.cpu() for v in input_sample.pixel_values_videos], dim=0
+                    ),
                     model_specific_data={
                         "video_grid_thw": torch.stack(input_sample.video_thw_grids)
                     },

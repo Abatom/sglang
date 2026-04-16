@@ -1543,7 +1543,10 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif "MiMoV2FlashForCausalLM" in model_architectures or "MiMoV2OmniForCausalLM" in model_architectures:
+    elif (
+        "MiMoV2FlashForCausalLM" in model_architectures
+        or "MiMoV2OmniForCausalLM" in model_architectures
+    ):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1

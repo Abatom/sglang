@@ -15,14 +15,15 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda
 
 if is_cuda():
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -30,6 +31,7 @@ else:
     # TODO: add non-CUDA support for MiMoAudioTokenizer
     def flash_attn_varlen_func(*args, **kwargs):
         raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
+
 
 logger = logging.getLogger(__name__)
 
@@ -363,9 +365,7 @@ class EuclideanCodebook(nn.Module):
             embed_sum = x.t() @ embed_onehot
             _ema_inplace(self.embed_avg, embed_sum.t().contiguous(), self.decay)
             cluster_size = (
-                _laplace_smoothing(
-                    self.cluster_size, self.codebook_size, self.epsilon
-                )
+                _laplace_smoothing(self.cluster_size, self.codebook_size, self.epsilon)
                 * self.cluster_size.sum()
             )
             embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
@@ -1470,17 +1470,14 @@ class MimoAudioEncoder(nn.Module):
             self.server_args.model_path, "audio_tokenizer"
         )
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self.audio_tokenizer = self._load_audio_tokenizer(
-            audio_tokenizer_path, dev
-        )
+        self.audio_tokenizer = self._load_audio_tokenizer(audio_tokenizer_path, dev)
 
     @staticmethod
-    def _load_audio_tokenizer(
-        path: str, device: torch.device
-    ) -> MiMoAudioTokenizer:
+    def _load_audio_tokenizer(path: str, device: torch.device) -> MiMoAudioTokenizer:
         """Load MiMoAudioTokenizer manually to avoid new-transformers compat issues."""
         import json
         import os
+
         from safetensors.torch import load_file
 
         config_path = os.path.join(path, "config.json")
