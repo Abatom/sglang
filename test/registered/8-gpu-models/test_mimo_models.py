@@ -48,5 +48,22 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     accept_length_thres = 3.2
 
 
+class TestMiMoV2Omni(DefaultServerBase):
+    model = "XiaomiMiMo/MiMo-V2-Omni"
+    other_args = [
+        "--tp",
+        "8",
+        "--dp",
+        "2",
+        "--enable-dp-attention",
+        "--trust-remote-code",
+        "--mm-enable-dp-encoder",
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
