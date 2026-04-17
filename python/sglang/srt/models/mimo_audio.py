@@ -923,7 +923,7 @@ def tokenize_audio_batch(mels, audio_tokenizer_encoder, segment_size=6000, devic
 
 
 @dataclass
-class MimoAudioEncoderConfig:
+class MiMoAudioEncoderConfig:
     tokenizer_version: str = "v1"
     speech_vocab_size: str = "1025-1025-129-129-129-129-129-129"
     speech_zeroemb_idx: str = "1024-1024-128-128-128-128-128-128"
@@ -1132,8 +1132,8 @@ class MiMoV2AudioConfig:
         return config
 
 
-class MimoAudioEncoder(nn.Module):
-    config: MimoAudioEncoderConfig
+class MiMoAudioEncoder(nn.Module):
+    config: MiMoAudioEncoderConfig
 
     def __init__(self, config):
         super().__init__()

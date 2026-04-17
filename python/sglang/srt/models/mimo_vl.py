@@ -664,7 +664,7 @@ class VisionAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Mimo_VLVisionConfig(PretrainedConfig):
+class MiMo_VLVisionConfig(PretrainedConfig):
     model_type = "mimovl"
     base_config_key = "vision_config"
 
@@ -719,7 +719,7 @@ class Mimo_VLVisionConfig(PretrainedConfig):
         self.visual_token_window_size = visual_token_window_size
 
 
-class Mimo_VisionPatchEmbed(nn.Module):
+class MiMo_VisionPatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size: int = 16,
@@ -755,7 +755,7 @@ class Mimo_VisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class Mimo_VisionBlock(nn.Module):
+class MiMo_VisionBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -869,10 +869,10 @@ class Mimo_VisionBlock(nn.Module):
         return x
 
 
-class Mimo_VisionTransformer(nn.Module):
+class MiMo_VisionTransformer(nn.Module):
     def __init__(
         self,
-        vision_config: Mimo_VLVisionConfig,
+        vision_config: MiMo_VLVisionConfig,
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -901,7 +901,7 @@ class Mimo_VisionTransformer(nn.Module):
         self.patch_size = vision_config.patch_size
         self.use_data_parallel = self.server_args.mm_enable_dp_encoder
         mlp_hidden_size: int = vision_config.intermediate_size
-        self.patch_embed = Mimo_VisionPatchEmbed(
+        self.patch_embed = MiMo_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
             in_channels=in_channels,
@@ -921,7 +921,7 @@ class Mimo_VisionTransformer(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                Mimo_VisionBlock(
+                MiMo_VisionBlock(
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
