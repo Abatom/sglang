@@ -37,11 +37,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
-from sglang.srt.models.mimo_audio import MimoAudioEncoder, MimoAudioEncoderConfig
+from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_v2_flash import (
     MiMoV2FlashForCausalLM,
 )
-from sglang.srt.models.mimo_vl import Mimo_VisionTransformer, Mimo_VLVisionConfig
+from sglang.srt.models.mimo_vl import MiMo_VisionTransformer, MiMo_VLVisionConfig
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -57,16 +57,16 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        vision_config = Mimo_VLVisionConfig.from_dict(config.vision_config)
+        vision_config = MiMo_VLVisionConfig.from_dict(config.vision_config)
         # Omni ViT/Audio Encoder BF16
-        self.visual = Mimo_VisionTransformer(
+        self.visual = MiMo_VisionTransformer(
             vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             quant_config=None,
             prefix=add_prefix("visual", prefix),
         )
-        self.audio_config = MimoAudioEncoderConfig(**config.audio_config)
-        self.audio_encoder = MimoAudioEncoder(self.audio_config)
+        self.audio_config = MiMoAudioEncoderConfig(**config.audio_config)
+        self.audio_encoder = MiMoAudioEncoder(self.audio_config)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
