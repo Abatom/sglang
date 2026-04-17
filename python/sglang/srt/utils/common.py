@@ -919,7 +919,7 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes, "VideoData"], use_gpu: bool = True):
+def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
         video_file = video_file.url
 
