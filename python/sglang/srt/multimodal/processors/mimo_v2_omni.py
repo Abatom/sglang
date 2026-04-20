@@ -1559,8 +1559,6 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
                     use_audio = preprocess_kwargs["use_audio"]
                 elif isinstance(raw_video_source, str):
                     use_audio = self.has_audio_track(raw_video_source)
-                elif isinstance(video, VideoData):
-                    use_audio = self.has_audio_track(raw_video_source.url)
                 else:
                     use_audio = False
 
