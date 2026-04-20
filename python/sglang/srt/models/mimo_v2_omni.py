@@ -41,7 +41,7 @@ from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfi
 from sglang.srt.models.mimo_v2_flash import (
     MiMoV2FlashForCausalLM,
 )
-from sglang.srt.models.mimo_vl import MiMo_VisionTransformer, MiMo_VLVisionConfig
+from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -57,9 +57,9 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        vision_config = MiMo_VLVisionConfig.from_dict(config.vision_config)
+        vision_config = MiMoVLVisionConfig.from_dict(config.vision_config)
         # Omni ViT/Audio Encoder BF16
-        self.visual = MiMo_VisionTransformer(
+        self.visual = MiMoVisionTransformer(
             vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             quant_config=None,

@@ -659,12 +659,7 @@ class VisionAttention(nn.Module):
         return output
 
 
-# ---------------------------------------------------------------------------
-# Vision config / ViT
-# ---------------------------------------------------------------------------
-
-
-class MiMo_VLVisionConfig(PretrainedConfig):
+class MiMoVLVisionConfig(PretrainedConfig):
     model_type = "mimovl"
     base_config_key = "vision_config"
 
@@ -719,7 +714,7 @@ class MiMo_VLVisionConfig(PretrainedConfig):
         self.visual_token_window_size = visual_token_window_size
 
 
-class MiMo_VisionPatchEmbed(nn.Module):
+class MiMoVisionPatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size: int = 16,
@@ -755,7 +750,7 @@ class MiMo_VisionPatchEmbed(nn.Module):
         return hidden_states
 
 
-class MiMo_VisionBlock(nn.Module):
+class MiMoVisionBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -869,10 +864,10 @@ class MiMo_VisionBlock(nn.Module):
         return x
 
 
-class MiMo_VisionTransformer(nn.Module):
+class MiMoVisionTransformer(nn.Module):
     def __init__(
         self,
-        vision_config: MiMo_VLVisionConfig,
+        vision_config: MiMoVLVisionConfig,
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -901,7 +896,7 @@ class MiMo_VisionTransformer(nn.Module):
         self.patch_size = vision_config.patch_size
         self.use_data_parallel = self.server_args.mm_enable_dp_encoder
         mlp_hidden_size: int = vision_config.intermediate_size
-        self.patch_embed = MiMo_VisionPatchEmbed(
+        self.patch_embed = MiMoVisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
             in_channels=in_channels,
@@ -921,7 +916,7 @@ class MiMo_VisionTransformer(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                MiMo_VisionBlock(
+                MiMoVisionBlock(
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
