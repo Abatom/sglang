@@ -1464,6 +1464,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
             use_per_grid_t_timestamps=processor_config.get(
                 "use_per_grid_t_timestamps", False
             ),
+            audio_sampling_rate=self.audio_sample_rate,
             image_token_id=self.IM_TOKEN_ID,
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.AUDIO_TOKEN_ID,
