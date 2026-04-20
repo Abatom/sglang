@@ -320,10 +320,17 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
             if "mtp" in name:
                 continue
 
-            # Checkpoint stores fused qkv_proj; manually chunk for TP
+            # fused qkv_proj in the checkpoint is stored TP-interleaved for
+            # tp=4, i.e. [Q_r0;K_r0;V_r0; Q_r1;K_r1;V_r1; ...], so chunk(4)
+            # gives each rank exactly [Q_local;K_local;V_local]. Other TP
+            # sizes would scramble Q/K/V boundaries, hence the hard assert.
             if "qkv_proj" in name:
                 if name in params_dict:
                     tp_size = get_attention_tp_size()
+                    assert tp_size == 4, (
+                        f"MiMoV2Omni fused qkv_proj checkpoint is TP=4-"
+                        f"interleaved; got tp_size={tp_size}."
+                    )
                     tp_rank = get_attention_tp_rank()
                     param = params_dict[name]
                     loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
