@@ -694,7 +694,7 @@ class TestConversationMethods(CustomTestCase):
         conv.video_data = []
         conv.append_video("http://example.com/vid.mp4")
         self.assertEqual(len(conv.video_data), 1)
-        self.assertEqual(conv.video_data[0], "http://example.com/vid.mp4")
+        self.assertEqual(conv.video_data[0].url, "http://example.com/vid.mp4")
 
     def test_append_audio(self):
         """Test appending audio data to conversation."""
@@ -1128,7 +1128,7 @@ class TestGenerateChatConv(CustomTestCase):
         )
         conv = generate_chat_conv(request, "chatml")
         self.assertEqual(len(conv.video_data), 1)
-        self.assertEqual(conv.video_data[0], "http://example.com/vid.mp4")
+        self.assertEqual(conv.video_data[0].url, "http://example.com/vid.mp4")
 
     def test_user_message_with_audio(self):
         """Test user message with audio content part."""
