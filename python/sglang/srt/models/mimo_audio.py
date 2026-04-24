@@ -1196,9 +1196,15 @@ class MiMoAudioEncoder(nn.Module):
                 f"Invalid projection layers: {self.config.projection_layers}"
             )
 
-        audio_tokenizer_path = os.path.join(
-            self.server_args.model_path, "audio_tokenizer"
-        )
+        model_path = self.server_args.model_path
+        if not os.path.isdir(model_path):
+            from huggingface_hub import snapshot_download
+
+            model_path = snapshot_download(
+                model_path,
+                allow_patterns=["audio_tokenizer/*"],
+            )
+        audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.audio_tokenizer = self._load_audio_tokenizer(audio_tokenizer_path, dev)
 
