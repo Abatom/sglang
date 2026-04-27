@@ -97,7 +97,7 @@ class Conversation:
     audio_token: str = "<audio>"
 
     image_data: Optional[List[ImageData]] = None
-    video_data: Optional[List[VideoData]] = None
+    video_data: Optional[List[Union[str, VideoData]]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -415,7 +415,10 @@ class Conversation:
 
     def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
-        self.video_data.append(VideoData(video, preprocess_kwargs=preprocess_kwargs))
+        if preprocess_kwargs:
+            self.video_data.append(VideoData(video, preprocess_kwargs=preprocess_kwargs))
+        else:
+            self.video_data.append(video)
 
     def append_audio(self, audio: str):
         """Append a new audio."""
