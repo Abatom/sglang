@@ -921,6 +921,7 @@ def _normalize_video_input(
 
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
+        # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
 
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
