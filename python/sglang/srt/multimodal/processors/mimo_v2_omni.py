@@ -1282,12 +1282,11 @@ class MiMoOmniProcessor:
         device_key = str(images.device)
         if device_key not in _mean_std_cache:
             _mean_std_cache[device_key] = (
-                _QWEN2VL_PIXEL_MEAN.detach().clone().to(images.device).view(
-                    1, -1, 1, 1
-                ),
-                _QWEN2VL_PIXEL_STD.detach().clone().to(images.device).view(
-                    1, -1, 1, 1
-                ),
+                _QWEN2VL_PIXEL_MEAN.detach()
+                .clone()
+                .to(images.device)
+                .view(1, -1, 1, 1),
+                _QWEN2VL_PIXEL_STD.detach().clone().to(images.device).view(1, -1, 1, 1),
             )
         mean, std = _mean_std_cache[device_key]
         return (images - mean) / std

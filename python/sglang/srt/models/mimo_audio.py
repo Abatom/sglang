@@ -157,7 +157,9 @@ class AudioRotaryEmbedding(nn.Module):
 class EuclideanCodebook(nn.Module):
     """Codebook with Euclidean distance (inference-only)."""
 
-    def __init__(self, dim: int, codebook_size: int, kmeans_init: bool = False, **kwargs):
+    def __init__(
+        self, dim: int, codebook_size: int, kmeans_init: bool = False, **kwargs
+    ):
         super().__init__()
         init_fn = self._uniform_init if not kmeans_init else torch.zeros
         embed = init_fn(codebook_size, dim)
