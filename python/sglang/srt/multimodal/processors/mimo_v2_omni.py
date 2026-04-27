@@ -43,15 +43,6 @@ from sglang.srt.utils import ImageData, VideoData
 from sglang.utils import logger
 
 try:
-    import decord
-    from decord import VideoReader
-
-    decord.bridge.set_bridge("torch")
-except ImportError:
-    decord = None
-    VideoReader = None
-
-try:
     import torchaudio
     from torchaudio.transforms import MelSpectrogram
 except ImportError:
@@ -77,7 +68,7 @@ class ImageInput:
 
 @dataclass
 class VideoInput:
-    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]
+    video: str | bytes | tuple[torch.Tensor, torch.Tensor]
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     total_max_pixels: Optional[int] = None
@@ -91,7 +82,7 @@ class VideoInput:
     segment_type: Literal["individual", "partial"] = "individual"
 
     def __post_init__(self):
-        if not isinstance(self.video, (VideoReader, str, bytes, tuple)):
+        if not isinstance(self.video, (str, bytes, tuple)):
             raise ValueError(
                 f"video must be a str, bytes, or tuple, but got {type(self.video)}"
             )
@@ -161,7 +152,7 @@ class AudioInput:
 
 @dataclass
 class VideoAudioInput:
-    video: VideoReader | str | bytes | tuple[torch.Tensor, torch.Tensor]
+    video: str | bytes | tuple[torch.Tensor, torch.Tensor]
     audio: str | bytes | torch.Tensor
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
@@ -176,7 +167,7 @@ class VideoAudioInput:
     segment_type: Literal["individual", "partial"] = "individual"
 
     def __post_init__(self):
-        if not isinstance(self.video, (VideoReader, str, bytes, tuple)):
+        if not isinstance(self.video, (str, bytes, tuple)):
             raise ValueError(
                 f"video must be a str, bytes, or tuple, but got {type(self.video)}"
             )
