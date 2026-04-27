@@ -50,7 +50,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     accept_length_thres = 3.2
 
 
-MIMO_V2_OMNI_MODEL = "XiaomiMiMo/MiMo-V2-Omni"
+MIMO_V2_OMNI_MODEL = "XiaomiMiMo/MiMo-V2.5"
 MIMO_V2_OMNI_OTHER_ARGS = [
     "--tp",
     "8",
