@@ -416,7 +416,9 @@ class Conversation:
     def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
         if preprocess_kwargs:
-            self.video_data.append(VideoData(video, preprocess_kwargs=preprocess_kwargs))
+            self.video_data.append(
+                VideoData(video, preprocess_kwargs=preprocess_kwargs)
+            )
         else:
             self.video_data.append(video)
 

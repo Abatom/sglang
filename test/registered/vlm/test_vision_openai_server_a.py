@@ -52,7 +52,6 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     ]
 
 
-
 class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):

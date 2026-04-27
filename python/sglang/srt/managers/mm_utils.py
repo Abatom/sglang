@@ -1622,7 +1622,9 @@ def wrap_shm_features(obj):
                     )
                     for t in feat
                 ]
-                item.feature = type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
+                item.feature = (
+                    type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
+                )
     return obj
 
 
@@ -1672,5 +1674,7 @@ def unwrap_shm_features(obj):
                     t.materialize() if isinstance(t, ShmPointerMMData) else t
                     for t in feat
                 ]
-                item.feature = type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
+                item.feature = (
+                    type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
+                )
     return obj
