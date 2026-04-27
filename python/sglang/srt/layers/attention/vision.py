@@ -881,8 +881,8 @@ class VisionAttention(nn.Module):
 
         self.window_size = window_size
         if use_sink:
-            # Init and load full sharded sink parameters; use only the local
-            # partition in the attention forward.
+            # Allocate the full (unsharded) sink tensor for weight loading;
+            # only the local TP slice is used in forward.
             self.sinks = nn.Parameter(
                 torch.empty(
                     self.num_attention_heads_per_partition * self.tp_size,
