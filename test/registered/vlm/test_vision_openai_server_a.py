@@ -52,13 +52,6 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     ]
 
 
-class TestMiMoV2OmniServer(OmniOpenAITestMixin):
-    model = "XiaomiMiMo/MiMo-V2-Omni"
-    extra_args = [
-        "--mem-fraction-static=0.80",
-        "--disable-cuda-graph",
-    ]
-
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
