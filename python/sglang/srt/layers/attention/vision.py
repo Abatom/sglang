@@ -416,6 +416,7 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens_k=cu_seqlens[0],
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
+                softmax_scale=softmax_scale,
                 window_size=window_size,
             )
             if s_aux is not None:
@@ -432,6 +433,7 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
+                softmax_scale=softmax_scale,
                 window_size=window_size,
             )
             if s_aux is not None:
@@ -1161,6 +1163,7 @@ class VisionAttention(nn.Module):
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
             output_ws=attn_output_ws,
+            softmax_scale=self.softmax_scale,
             window_size=effective_window_size,
             s_aux=s_aux,
         )
