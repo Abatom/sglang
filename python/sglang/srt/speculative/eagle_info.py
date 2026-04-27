@@ -78,6 +78,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
+        if self.num_tokens_per_req < 0:
+            self.num_tokens_per_req = self.draft_token_num
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num

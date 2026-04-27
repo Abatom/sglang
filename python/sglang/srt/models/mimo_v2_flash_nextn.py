@@ -298,11 +298,11 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
 
-                if weight_name not in name:
+                if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:
                     break
-                name = name.replace(weight_name, param_name)
+                name = name.replace(f".{weight_name}.", f".{param_name}.")
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue

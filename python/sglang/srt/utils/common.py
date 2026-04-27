@@ -2849,6 +2849,7 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs

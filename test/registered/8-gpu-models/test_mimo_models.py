@@ -50,8 +50,8 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     accept_length_thres = 3.2
 
 
-MIMO_V2_OMNI_MODEL = "XiaomiMiMo/MiMo-V2.5"
-MIMO_V2_OMNI_OTHER_ARGS = [
+MIMO_V2_MODEL = "XiaomiMiMo/MiMo-V2.5"
+MIMO_V2_OTHER_ARGS = [
     "--tp",
     "8",
     "--dp",
@@ -66,16 +66,16 @@ MIMO_V2_OMNI_OTHER_ARGS = [
 ]
 
 
-class TestMiMoV2OmniGSM8K(GSM8KMixin, DefaultServerBase):
+class TestMiMoV2GSM8K(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
-    model = MIMO_V2_OMNI_MODEL
-    other_args = MIMO_V2_OMNI_OTHER_ARGS
+    model = MIMO_V2_MODEL
+    other_args = MIMO_V2_OTHER_ARGS
 
 
-class TestMiMoV2OmniMMMU(MMMUMixin, MMMUServerBase):
+class TestMiMoV2MMMU(MMMUMixin, MMMUServerBase):
     accuracy = 0.444
-    model = MIMO_V2_OMNI_MODEL
-    other_args = MIMO_V2_OMNI_OTHER_ARGS
+    model = MIMO_V2_MODEL
+    other_args = MIMO_V2_OTHER_ARGS
     mmmu_args = ["--limit=0.1"]
 
 

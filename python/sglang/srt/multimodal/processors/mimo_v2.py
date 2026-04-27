@@ -1,4 +1,4 @@
-"""MiMoV2 Omni multimodal processor -- protocol, utilities, and processor."""
+"""MiMoV2 multimodal processor -- protocol, utilities, and processor."""
 
 import asyncio
 import base64
@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.mimo_v2_omni import MiMoV2OmniForCausalLM
+from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -209,7 +209,7 @@ TextInput = str | list[int]
 
 
 @dataclass
-class MiMoOmniInputSample:
+class MiMoInputSample:
     input_ids: torch.Tensor
     labels: Optional[torch.Tensor]
     pixel_values: list[torch.Tensor]
@@ -268,7 +268,7 @@ _QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
 _mean_std_cache = {}
 
 
-class MiMoOmniProcessor:
+class MiMoProcessor:
     def __init__(
         self,
         tokenizer,
@@ -444,7 +444,7 @@ class MiMoOmniProcessor:
         self.http_session = requests.Session()
         for k in kwargs:
             logger.info(
-                f"[Warning] Ignored unknown parameter {k} for MiMoOmniProcessor"
+                f"[Warning] Ignored unknown parameter {k} for MiMoProcessor"
             )
 
     @property
@@ -1161,7 +1161,7 @@ class MiMoOmniProcessor:
         if verbose:
             print(verbose_str.strip())
 
-        return MiMoOmniInputSample(
+        return MiMoInputSample(
             input_ids=input_ids,
             labels=labels,
             pixel_values=image_pixel_values,
@@ -1375,8 +1375,8 @@ class MiMoOmniProcessor:
         return image
 
 
-class MiMoV2OmniProcessor(BaseMultimodalProcessor):
-    models = [MiMoV2OmniForCausalLM]
+class MiMoV2Processor(BaseMultimodalProcessor):
+    models = [MiMoV2ForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -1431,7 +1431,7 @@ class MiMoV2OmniProcessor(BaseMultimodalProcessor):
         )
         device = server_args.device if self.use_image_processor_gpu else None
 
-        self.mimo_processor = MiMoOmniProcessor(
+        self.mimo_processor = MiMoProcessor(
             tokenizer=self._processor.tokenizer,
             patch_size=patch_size,
             image_min_pixels=processor_config.get("image_min_pixels", None)

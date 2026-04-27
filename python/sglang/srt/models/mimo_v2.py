@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only MiMo-V2-Omni model compatible with HuggingFace weights."""
+"""Inference-only MiMo-V2 model compatible with HuggingFace weights."""
 
 import logging
 from typing import Iterable, List, Optional, Tuple
@@ -44,19 +44,19 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
-MiMoV2OmniConfig = None
+MiMoV2Config = None
 
 
-class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
+class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
     def __init__(
         self,
-        config: MiMoV2OmniConfig,
+        config: MiMoV2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
         vision_config = MiMoVLVisionConfig.from_dict(config.vision_config)
-        # Omni ViT/Audio Encoder BF16
+        # MiMo V2 ViT/Audio Encoder BF16
         self.visual = MiMoVisionTransformer(
             vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -322,7 +322,7 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
                 if name in params_dict:
                     tp_size = get_attention_tp_size()
                     assert tp_size == 4, (
-                        f"MiMoV2Omni fused qkv_proj checkpoint is TP=4-"
+                        f"MiMoV2 fused qkv_proj checkpoint is TP=4-"
                         f"interleaved; got tp_size={tp_size}."
                     )
                     tp_rank = get_attention_tp_rank()
@@ -404,4 +404,4 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = MiMoV2OmniForCausalLM
+EntryClass = MiMoV2ForCausalLM

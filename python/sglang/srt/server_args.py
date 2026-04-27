@@ -76,6 +76,10 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+MIMO_V2_MODEL_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -1948,11 +1952,11 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif "MiMoV2FlashForCausalLM" in model_arch:
+        elif model_arch in MIMO_V2_MODEL_ARCHS:
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
                 )
                 if not envs.SGLANG_ENABLE_SPEC_V2.get():
                     envs.SGLANG_ENABLE_SPEC_V2.set(True)
@@ -1963,11 +1967,11 @@ class ServerArgs:
             if self.enable_hierarchical_cache:
                 self.swa_full_tokens_ratio = 1.0
                 logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
                 )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
+                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
         elif "Step3p5ForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -7318,6 +7322,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     ]:
         return (3, 1, 4)
