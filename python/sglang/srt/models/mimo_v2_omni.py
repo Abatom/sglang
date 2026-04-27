@@ -12,9 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-# Adapted from llama2.py
-# Modify details for the adaptation of Qwen2 model.
-"""Inference-only Qwen2 model compatible with HuggingFace weights."""
+"""Inference-only MiMo-V2-Omni model compatible with HuggingFace weights."""
 
 import logging
 from typing import Iterable, List, Optional, Tuple
@@ -77,7 +75,7 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -88,7 +86,7 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        video_grid_thw = torch.cat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
@@ -272,11 +270,7 @@ class MiMoV2OmniForCausalLM(MiMoV2FlashForCausalLM):
                         continue
                     param = params_dict[name]
                 except KeyError:
-                    print(params_dict.keys())
                     raise
-
-                # if "merger" in name and name.endswith(".bias"):
-                #     loaded_weight = param.data * 0.0
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
