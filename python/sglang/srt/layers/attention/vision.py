@@ -420,7 +420,7 @@ class VisionFlash3Attention(nn.Module):
             )
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
-            output = flash_attn_func(q, k, v, **fa_kwargs)
+            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
@@ -436,7 +436,7 @@ class VisionFlash3Attention(nn.Module):
             )
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
-            output = flash_attn_func(q, k, v, **fa_kwargs)
+            output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
 
         return output
 
