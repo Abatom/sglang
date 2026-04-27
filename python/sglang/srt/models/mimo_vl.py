@@ -42,7 +42,7 @@ class MiMoVLVisionConfig(PretrainedConfig):
         out_hidden_size=2048,
         fullatt_block_indexes=[7, 15, 23, 31],
         initializer_range=0.02,
-        kv_channels=64,  # HACK
+        kv_channels=64,
         qk_channels=64,
         num_query_groups=4,
         num_key_value_heads=8,
@@ -264,7 +264,6 @@ class MiMoVisionTransformer(nn.Module):
         )
         self.use_sink = getattr(vision_config, "use_sink", False)
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        # head_dim = hidden_size // num_heads  # HACK
         head_dim = (
             self.qk_channels
             if self.qk_channels is not None
