@@ -1614,7 +1614,7 @@ def wrap_shm_features(obj):
             if isinstance(feat, torch.Tensor) and feat.is_cpu:
                 item.feature = ShmPointerMMData(feat)
             elif isinstance(feat, (list, tuple)):
-                item.feature = [
+                wrapped = [
                     (
                         ShmPointerMMData(t)
                         if isinstance(t, torch.Tensor) and t.is_cpu
@@ -1622,6 +1622,7 @@ def wrap_shm_features(obj):
                     )
                     for t in feat
                 ]
+                item.feature = type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
     return obj
 
 
@@ -1667,8 +1668,9 @@ def unwrap_shm_features(obj):
             if isinstance(feat, ShmPointerMMData):
                 item.feature = feat.materialize()
             elif isinstance(feat, (list, tuple)):
-                item.feature = [
+                unwrapped = [
                     t.materialize() if isinstance(t, ShmPointerMMData) else t
                     for t in feat
                 ]
+                item.feature = type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
     return obj
