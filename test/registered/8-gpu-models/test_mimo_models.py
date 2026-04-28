@@ -57,25 +57,33 @@ MIMO_V2_OTHER_ARGS = [
     "--dp",
     "2",
     "--enable-dp-attention",
-    "--trust-remote-code",
     "--mm-enable-dp-encoder",
     "--attention-backend",
     "fa3",
     "--mm-attention-backend",
     "fa3",
 ]
+MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--enable-multi-layer-eagle",
+]
 
 
-class TestMiMoV2GSM8K(GSM8KMixin, DefaultServerBase):
+class TestMiMoV2(GSM8KMixin, MMMUMixin, MMMUServerBase):
     gsm8k_accuracy_thres = 0.75
-    model = MIMO_V2_MODEL
-    other_args = MIMO_V2_OTHER_ARGS
-
-
-class TestMiMoV2MMMU(MMMUMixin, MMMUServerBase):
+    gsm8k_accept_length_thres = 3.0
     accuracy = 0.444
     model = MIMO_V2_MODEL
-    other_args = MIMO_V2_OTHER_ARGS
+    mem_fraction_static = 0.65
+    server_api_key = None
+    other_args = MIMO_V2_MTP_OTHER_ARGS
     mmmu_args = ["--limit=0.1"]
 
 

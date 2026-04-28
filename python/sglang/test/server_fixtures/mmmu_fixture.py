@@ -29,6 +29,7 @@ class MMMUServerBase(CustomTestCase):
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     other_args: list[str] = []
     mem_fraction_static: float = DEFAULT_MEM_FRACTION_STATIC
+    server_api_key = "sk-123456"
 
     @classmethod
     def setUpClass(cls):
@@ -53,7 +54,7 @@ class MMMUServerBase(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=cls.timeout,
-            api_key=cls.api_key,
+            api_key=cls.server_api_key,
             other_args=server_args,
             env=process_env,
         )

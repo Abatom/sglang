@@ -88,7 +88,9 @@ MiMoV2Config = None
 logger = logging.getLogger(__name__)
 
 
-def load_mimo_v2_qkv_proj_weight(name, param, loaded_weight):
+def load_mimo_v2_qkv_proj_weight(
+    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+):
     if loaded_weight.shape == param.shape:
         default_weight_loader(param, loaded_weight)
         return
@@ -101,6 +103,12 @@ def load_mimo_v2_qkv_proj_weight(name, param, loaded_weight):
 
     tp_size = get_attention_tp_size()
     tp_rank = get_attention_tp_rank()
+    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
+
     fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
     if tuple(loaded_weight.shape) != fused_shape:
         raise ValueError(
@@ -1298,7 +1306,14 @@ class MiMoV2ForCausalLM(nn.Module):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(name, param, loaded_weight)
+                    expected_fused_tp_size = (
+                        4
+                        if self.config.architectures[0] == "MiMoV2ForCausalLM"
+                        else None
+                    )
+                    load_mimo_v2_qkv_proj_weight(
+                        name, param, loaded_weight, expected_fused_tp_size
+                    )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
