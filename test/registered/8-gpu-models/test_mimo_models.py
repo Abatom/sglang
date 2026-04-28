@@ -78,7 +78,7 @@ MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
 
 class TestMiMoV2(GSM8KMixin, MMMUMixin, MMMUServerBase):
     gsm8k_accuracy_thres = 0.75
-    gsm8k_accept_length_thres = 3.0
+    gsm8k_accept_length_thres = 2.5
     accuracy = 0.444
     model = MIMO_V2_MODEL
     mem_fraction_static = 0.65

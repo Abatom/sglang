@@ -305,7 +305,12 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(name, param, loaded_weight)
+                    load_mimo_v2_qkv_proj_weight(
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size=4,
+                    )
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

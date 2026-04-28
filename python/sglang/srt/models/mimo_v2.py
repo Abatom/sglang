@@ -92,6 +92,7 @@ def load_mimo_v2_qkv_proj_weight(
     name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
 ):
     if loaded_weight.shape == param.shape:
+        # The checkpoint already stores this rank's qkv_proj shard.
         default_weight_loader(param, loaded_weight)
         return
 

@@ -22,6 +22,8 @@ class MMMUServerBase(CustomTestCase):
     This fixture handles server lifecycle for single-model MMMU tests.
     For multi-model tests that need to start/stop servers within test methods,
     use MMMUMultiModelTestBase instead.
+    Set server_api_key = None to launch without auth when sharing the server
+    with mixins whose clients do not send API keys.
     """
 
     model = None
