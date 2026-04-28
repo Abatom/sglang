@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.models.mimo_v2_flash_nextn import MiMoV2MTP
+from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
 
 
 class _Config:
