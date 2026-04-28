@@ -28,7 +28,6 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -44,6 +43,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -305,11 +305,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    if loaded_weight.shape != param.shape:
-                        tp_size = get_attention_tp_size()
-                        tp_rank = get_attention_tp_rank()
-                        loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
+                    load_mimo_v2_qkv_proj_weight(name, param, loaded_weight)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

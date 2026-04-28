@@ -88,6 +88,29 @@ MiMoV2Config = None
 logger = logging.getLogger(__name__)
 
 
+def load_mimo_v2_qkv_proj_weight(name, param, loaded_weight):
+    if loaded_weight.shape == param.shape:
+        default_weight_loader(param, loaded_weight)
+        return
+
+    if loaded_weight.ndim != param.ndim or loaded_weight.shape[1:] != param.shape[1:]:
+        raise ValueError(
+            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
+            f"expected sharded {tuple(param.shape)}"
+        )
+
+    tp_size = get_attention_tp_size()
+    tp_rank = get_attention_tp_rank()
+    fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
+    if tuple(loaded_weight.shape) != fused_shape:
+        raise ValueError(
+            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
+            f"expected fused {fused_shape} or sharded {tuple(param.shape)}"
+        )
+
+    default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+
+
 class MiMoV2MLP(nn.Module):
     def __init__(
         self,
@@ -1133,6 +1156,7 @@ class MiMoV2ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        skipped_mtp_weights = False
 
         for name, loaded_weight in weights:
             if not self._is_multimodal and (
@@ -1260,19 +1284,21 @@ class MiMoV2ForCausalLM(nn.Module):
                 else:
                     continue
 
-            # TODO: skip mtp weights for now, need to implement mtp
             if "mtp" in name:
+                if not skipped_mtp_weights:
+                    logger.info(
+                        "Skipping draft-only MiMo-V2 MTP weights while loading the "
+                        "target model; MiMoV2MTP loads these weights in the draft "
+                        "model runner."
+                    )
+                    skipped_mtp_weights = True
                 continue
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    if loaded_weight.shape != param.shape:
-                        tp_size = get_attention_tp_size()
-                        tp_rank = get_attention_tp_rank()
-                        loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
+                    load_mimo_v2_qkv_proj_weight(name, param, loaded_weight)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

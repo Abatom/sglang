@@ -27,7 +27,7 @@ from sglang.srt.utils import is_cuda
 if is_cuda():
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 else:
-    # TODO: add non-CUDA support for MiMoAudioTokenizer
+
     def flash_attn_varlen_func(*args, **kwargs):
         raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
 
@@ -52,10 +52,13 @@ def _compute_default_rope_parameters(
             if hasattr(config, "partial_rotary_factor")
             else 1.0
         )
-        head_dim = (
-            getattr(config, "head_dim", None)
-            or config.hidden_size // config.num_attention_heads
-        )
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // config.num_attention_heads
+            logger.info(
+                "audio.head_dim not set; defaulting to hidden_size/num_heads = %d",
+                head_dim,
+            )
         dim = int(head_dim * partial_rotary_factor)
     attention_factor = 1.0
     inv_freq = 1.0 / (
@@ -993,7 +996,6 @@ class MiMoV2AudioConfig:
         input_projection_layers: int = 2,
         output_projection_layers: int = 2,
         add_encoder_post_norm: bool = True,
-        # add_decoder_post_norm: bool = True,
         audio_config: dict = None,
         **kwargs,
     ):
@@ -1028,7 +1030,6 @@ class MiMoV2AudioConfig:
             self.input_projection_layers = input_projection_layers
             self.output_projection_layers = output_projection_layers
             self.add_encoder_post_norm = add_encoder_post_norm
-            # self.add_decoder_post_norm = add_decoder_post_norm
 
         self._attn_implementation_internal = "sdpa"
 
@@ -1044,6 +1045,7 @@ class MiMoV2AudioConfig:
             "speech_lm_head_sizes", self.speech_vocab_size
         )
         self.speech_zeroemb_idx = audio_config.get("speech_zeroemb_idx", "1280")
+        # Per-channel decode delays; len must equal audio_channels.
         self.delay_pattern = audio_config.get(
             "audio_output_delay_pattern", "0-1-2-3-4-5-6-7-7-7-7-7-7-7-7-7-7-7-7-7"
         )
@@ -1078,7 +1080,6 @@ class MiMoV2AudioConfig:
         self.output_projection_layers = audio_config.get("output_projection_layers", 2)
 
         self.add_encoder_post_norm = audio_config.get("add_encoder_post_norm", True)
-        # self.add_decoder_post_norm = audio_config.get("add_decoder_post_norm", True)
 
     def _parse_maybe_list(self, value: str | int, length: int) -> list[int]:
         if isinstance(value, str) and "-" in value:
@@ -1108,6 +1109,11 @@ class MiMoV2AudioConfig:
         config.num_hidden_layers = self.input_local_layers
         config.num_attention_heads = self.input_local_attn_heads
         config.num_key_value_heads = self.input_local_attn_heads
+        config.head_dim = getattr(
+            self,
+            "input_local_head_dim",
+            self.input_local_dim // self.input_local_attn_heads,
+        )
         config.intermediate_size = self.input_local_intermediate_size
         config.rope_theta = self.input_local_rope_theta
         config.partial_rotary_factor = self.input_local_partial_rotary_factor
@@ -1126,6 +1132,7 @@ class MiMoV2AudioConfig:
         config.num_hidden_layers = self.output_local_layers
         config.num_attention_heads = self.output_local_attn_heads
         config.num_key_value_heads = self.output_local_attn_heads
+        config.head_dim = self.output_local_dim // self.output_local_attn_heads
         config.intermediate_size = self.output_local_intermediate_size
         config.rope_theta = self.output_local_rope_theta
         config.partial_rotary_factor = self.output_local_partial_rotary_factor
@@ -1164,6 +1171,7 @@ class MiMoAudioEncoder(nn.Module):
             rope_theta=self.config.rope_theta,
             partial_rotary_factor=self.config.partial_rotary_factor,
         )
+        input_local_config.head_dim = self.config.input_local_head_dim
 
         self.input_local_transformer = Qwen2Model(input_local_config)
 
@@ -1258,7 +1266,7 @@ class MiMoAudioEncoder(nn.Module):
             return_dict=True,
             is_causal=not self.config.input_full_attention,  # for SDPA
         )
-        return output.last_hidden_state  # [T//group_size,  group_size, hidden_size]
+        return output.last_hidden_state  # [T//group_size, group_size, input_local_dim]
 
     def apply_speech_embeddings(self, audio_codes: torch.Tensor) -> torch.Tensor:
         num_segments = audio_codes.shape[0]
@@ -1336,7 +1344,7 @@ class MiMoAudioEncoder(nn.Module):
         _audio_embeddings = self.apply_speech_embeddings(audio_codes)
         audio_embeds = self.apply_input_local_transformer(
             _audio_embeddings
-        )  #  [T//group_size,  group_size, hidden_size]
+        )  #  [T//group_size,  group_size, input_local_dim]
         B = audio_embeds.shape[0]
         audio_embeds = self.projection(audio_embeds.reshape(B, -1))
         return audio_embeds

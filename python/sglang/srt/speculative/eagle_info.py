@@ -74,7 +74,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     grammar: BaseGrammarObject = None
 
     # Shape info for padding
-    num_tokens_per_req: int = -1
+    num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)

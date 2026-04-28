@@ -57,7 +57,6 @@ class MiMoVLVisionConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.num_heads = num_heads
-        # Support GQA: if num_key_value_heads is not provided, default to num_heads (MHA)
         if num_key_value_heads is None:
             num_key_value_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
@@ -244,10 +243,9 @@ class MiMoVisionTransformer(nn.Module):
         hidden_size: int = vision_config.hidden_size
         depth: int = vision_config.depth
         num_heads: int = vision_config.num_heads
-        # Support GQA: get num_kv_heads from config if available, otherwise default to num_heads
         num_kv_heads = getattr(vision_config, "num_key_value_heads", None)
         if num_kv_heads is None:
-            num_kv_heads = num_heads  # Default to MHA if not specified
+            num_kv_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_channels = getattr(vision_config, "qk_channels", None)
         self.kv_channels = getattr(vision_config, "kv_channels", None)
@@ -398,25 +396,21 @@ class MiMoVisionTransformer(nn.Module):
         window_index_1d_col = self.get_window_index_1d(grid_thw, col=True).to(
             device=x.device
         )
-        # Move window_index to the same device as x before using it to index x
         reverse_window_index_1d_col = torch.argsort(window_index_1d_col).to(
             device=x.device
         )
 
-        # Ensure rotary_pos_emb is on the same device/dtype as x
         rotary_pos_emb = rotary_pos_emb.to(device=x.device)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 
         def get_position_embeddings(emb, x):
             position_embeddings = (emb.cos(), emb.sin())
-            # After building position_embeddings, make sure both cos and sin are on the same device/dtype as the attention input
             position_embeddings = (
                 position_embeddings[0].to(x.device),
                 position_embeddings[1].to(x.device),
             )
             return position_embeddings
 
-        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
         seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )

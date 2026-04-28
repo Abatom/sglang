@@ -46,8 +46,8 @@ try:
     import torchaudio
     from torchaudio.transforms import MelSpectrogram
 except ImportError:
-    print(
-        "[Warning] torchaudio is not installed, audio inference will not be supported"
+    logger.warning(
+        "torchaudio is not installed; audio inputs will fail at request time"
     )
     torchaudio = None
     MelSpectrogram = None
@@ -443,15 +443,21 @@ class MiMoProcessor:
 
         self.http_session = requests.Session()
         for k in kwargs:
-            logger.info(
-                f"[Warning] Ignored unknown parameter {k} for MiMoProcessor"
-            )
+            logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoProcessor")
 
     @property
     def mel_spectrogram(self):
+        self._ensure_audio_dependencies()
         if self._mel_spectrogram is None:
             self._mel_spectrogram = MelSpectrogram(**self.mel_spectrogram_kwargs)
         return self._mel_spectrogram
+
+    @staticmethod
+    def _ensure_audio_dependencies():
+        if torchaudio is None or MelSpectrogram is None:
+            raise RuntimeError(
+                "torchaudio is required for audio inputs; install torchaudio"
+            )
 
     def prepare_image_kwargs(self, image: ImageInput):
         kwargs = {}
@@ -490,6 +496,7 @@ class MiMoProcessor:
         return kwargs
 
     def preprocess_audio(self, audio: str | bytes):
+        self._ensure_audio_dependencies()
         """
         - Input: audio filename string, bytes, or tuple of (waveform, original_sr)
         - Output:
@@ -1216,10 +1223,6 @@ class MiMoProcessor:
 
         return flatten_patches, thw_grids
 
-    # ------------------------------------------------------------------
-    # Static / class-level utility methods
-    # ------------------------------------------------------------------
-
     @staticmethod
     def format_timestamp(timestamp: float):
         minutes = int(timestamp // 60)
@@ -1237,12 +1240,9 @@ class MiMoProcessor:
         3. The aspect ratio of the image is maintained as closely as possible.
         """
         if min(height, width) < factor:
-            if height < width:
-                height = factor
-                width = int(width * (factor / height))
-            else:
-                width = factor
-                height = int(height * (factor / width))
+            scale = factor / min(height, width)
+            height = int(round(height * scale))
+            width = int(round(width * scale))
         elif max(height, width) / min(height, width) > 200:
             raise ValueError(
                 f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
@@ -1378,6 +1378,54 @@ class MiMoProcessor:
 class MiMoV2Processor(BaseMultimodalProcessor):
     models = [MiMoV2ForCausalLM]
 
+    @staticmethod
+    def _normalize_config_dict(config, name: str) -> dict:
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            return config
+        if hasattr(config, "to_dict"):
+            return config.to_dict()
+        raise ValueError(f"{name} must be a dict-like config, got {type(config)}")
+
+    @staticmethod
+    def _require_config_value(config: dict, key: str):
+        value = config.get(key)
+        if value is None:
+            raise ValueError(f"processor_config.{key} must be set for MiMo-V2")
+        return value
+
+    def _validate_placeholder_counts(
+        self,
+        text_parts,
+        multimodal_tokens_pattern,
+        image_count: int,
+        video_count: int,
+        audio_count: int,
+    ):
+        counts = {
+            Modality.IMAGE: 0,
+            Modality.VIDEO: 0,
+            Modality.AUDIO: 0,
+        }
+        for text_part in text_parts:
+            if multimodal_tokens_pattern.match(text_part):
+                modality = self.mm_tokens.get_modality_of_token(text_part)
+                if modality in counts:
+                    counts[modality] += 1
+
+        for modality, name, data_count in (
+            (Modality.IMAGE, "image", image_count),
+            (Modality.VIDEO, "video", video_count),
+            (Modality.AUDIO, "audio", audio_count),
+        ):
+            placeholder_count = counts[modality]
+            if placeholder_count != data_count:
+                raise ValueError(
+                    f"{name} placeholder/data mismatch: "
+                    f"{placeholder_count} placeholders vs {data_count} {name}s"
+                )
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)
@@ -1396,36 +1444,53 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             ):
                 rope_type = "mrope"
 
-        processor_config = getattr(hf_config, "processor_config", {})
-        audio_config = getattr(hf_config, "audio_config", None)
-        audio_sample_rate = None
-        if isinstance(audio_config, dict):
-            audio_sample_rate = audio_config.get("sampling_rate") or audio_config.get(
-                "sample_rate"
+        processor_config = self._normalize_config_dict(
+            getattr(hf_config, "processor_config", {}), "processor_config"
+        )
+        audio_config = self._normalize_config_dict(
+            getattr(hf_config, "audio_config", None), "audio_config"
+        )
+        self.audio_sample_rate = processor_config.get("audio_sampling_rate")
+        if self.audio_sample_rate is None:
+            self.audio_sample_rate = audio_config.get(
+                "sampling_rate"
+            ) or audio_config.get("sample_rate")
+        if self.audio_sample_rate is None:
+            raise ValueError(
+                "audio_sampling_rate must be set in processor_config or audio_config"
             )
-        elif audio_config is not None:
-            audio_sample_rate = getattr(audio_config, "sampling_rate", None) or getattr(
-                audio_config, "sample_rate", None
-            )
-        self.audio_sample_rate = (
-            processor_config.get("audio_sampling_rate", None)
-            or audio_sample_rate
-            or 16000
+
+        self.IM_START_TOKEN_ID = self._require_config_value(
+            processor_config, "vision_start_token_id"
+        )
+        self.IM_END_TOKEN_ID = self._require_config_value(
+            processor_config, "vision_end_token_id"
+        )
+        self.IM_TOKEN_ID = self._require_config_value(
+            processor_config, "image_token_id"
+        )
+        self.VIDEO_TOKEN_ID = self._require_config_value(
+            processor_config, "video_token_id"
+        )
+        self.vision_start_token_id = self.IM_START_TOKEN_ID
+        self.vision_end_token_id = self.IM_END_TOKEN_ID
+
+        self.AUDIO_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_token_id"
+        )
+        self.AUDIO_START_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_start_token_id"
+        )
+        self.AUDIO_END_TOKEN_ID = self._require_config_value(
+            processor_config, "audio_end_token_id"
         )
 
-        self.IM_START_TOKEN_ID = processor_config.get("vision_start_token_id", None)
-        self.IM_END_TOKEN_ID = processor_config.get("vision_end_token_id", None)
-        self.IM_TOKEN_ID = processor_config.get("image_token_id", None)
-        self.VIDEO_TOKEN_ID = processor_config.get("video_token_id", None)
-        self.vision_start_token_id = processor_config.get("vision_start_token_id", None)
-        self.vision_end_token_id = processor_config.get("vision_end_token_id", None)
-
-        self.AUDIO_TOKEN_ID = processor_config.get("audio_token_id", None)
-        self.AUDIO_START_TOKEN_ID = processor_config.get("audio_start_token_id", None)
-        self.AUDIO_END_TOKEN_ID = processor_config.get("audio_end_token_id", None)
-
-        self.video_start_token_id = processor_config.get("video_start_token_id", None)
-        self.video_end_token_id = processor_config.get("video_end_token_id", None)
+        self.video_start_token_id = self._require_config_value(
+            processor_config, "video_start_token_id"
+        )
+        self.video_end_token_id = self._require_config_value(
+            processor_config, "video_end_token_id"
+        )
         self.use_image_processor_gpu = (
             int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
         )
@@ -1584,6 +1649,13 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         if input_text and (processed_images or processed_videos or processed_audios):
             multimodal_tokens_pattern = self.mm_tokens.get_combined_regex()
             text_parts = re.split(multimodal_tokens_pattern, input_text)
+            self._validate_placeholder_counts(
+                text_parts,
+                multimodal_tokens_pattern,
+                len(processed_images),
+                len(processed_videos),
+                len(processed_audios),
+            )
 
             image_iter = iter(processed_images)
             video_iter = iter(processed_videos)
@@ -1593,27 +1665,18 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 if multimodal_tokens_pattern.match(text_part):
                     modality = self.mm_tokens.get_modality_of_token(text_part)
                     if modality == Modality.IMAGE:
-                        try:
-                            img = next(image_iter)
-                            contents.append(
-                                Content(type="image", content=ImageInput(image=img))
-                            )
-                        except StopIteration:
-                            pass
+                        img = next(image_iter)
+                        contents.append(
+                            Content(type="image", content=ImageInput(image=img))
+                        )
                     elif modality == Modality.VIDEO:
-                        try:
-                            video_data = next(video_iter)
-                            contents.append(self._make_video_content(*video_data))
-                        except StopIteration:
-                            pass
+                        video_data = next(video_iter)
+                        contents.append(self._make_video_content(*video_data))
                     elif modality == Modality.AUDIO:
-                        try:
-                            audio = next(audio_iter)
-                            contents.append(
-                                Content(type="audio", content=AudioInput(audio=audio))
-                            )
-                        except StopIteration:
-                            pass
+                        audio = next(audio_iter)
+                        contents.append(
+                            Content(type="audio", content=AudioInput(audio=audio))
+                        )
                 else:
                     if text_part:
                         contents.append(Content(type="text", content=text_part))
@@ -1745,6 +1808,13 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         raw_audio_iter = iter(raw_audio_data)
 
         text_parts = re.split(multimodal_tokens_pattern, base_output.input_text)
+        self._validate_placeholder_counts(
+            text_parts,
+            multimodal_tokens_pattern,
+            len(raw_image_data),
+            len(raw_video_data),
+            len(raw_audio_data),
+        )
         contents = []
 
         for text_part in text_parts:
@@ -1906,10 +1976,6 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             mrope_position_delta=input_sample.rope_deltas,
         )
 
-    # ------------------------------------------------------------------
-    # Static / class-level utility methods
-    # ------------------------------------------------------------------
-
     @staticmethod
     def has_audio_track(path_or_data: str) -> bool:
         try:
@@ -1931,9 +1997,18 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 else None
             )
             r = subprocess.run(cmd, input=inp, capture_output=True, timeout=30)
-            return bool(r.returncode == 0 and json.loads(r.stdout).get("streams"))
-        except Exception:
-            return False
+            if r.returncode != 0:
+                stderr = r.stderr.decode("utf-8", errors="replace")
+                raise RuntimeError(f"ffprobe failed for {path_or_data}: {stderr}")
+            return bool(json.loads(r.stdout).get("streams"))
+        except subprocess.TimeoutExpired:
+            logger.error("ffprobe timed out for %s", path_or_data)
+            raise
+        except FileNotFoundError as e:
+            raise RuntimeError("ffprobe not found; install ffmpeg") from e
+        except json.JSONDecodeError:
+            logger.error("ffprobe returned invalid JSON for %s", path_or_data)
+            raise
 
     @staticmethod
     def _make_video_content(
