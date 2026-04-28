@@ -47,9 +47,27 @@ MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
-    if getattr(hf_config, "attention_projection_layout", None) != "fused_qkv":
+    layout = getattr(hf_config, "attention_projection_layout", None)
+    if layout is None:
         return None
-    return getattr(hf_config, "num_key_value_heads", None)
+    if layout != "fused_qkv":
+        raise ValueError(
+            "MiMoV2 hf_config has unsupported "
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
+            "or unset."
+        )
+
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
+    text_config = getattr(hf_config, "text_config", None)
+    if num_key_value_heads is None and text_config is not None:
+        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
+    if num_key_value_heads is None:
+        raise ValueError(
+            "MiMoV2 hf_config has attention_projection_layout='fused_qkv' "
+            "but num_key_value_heads is missing; this value is required to "
+            "derive the fused qkv_proj TP size."
+        )
+    return num_key_value_heads
 
 
 class AttentionArch(IntEnum):
