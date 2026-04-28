@@ -1960,14 +1960,15 @@ class ServerArgs:
                 )
                 if effective_attn_tp_size != 4:
                     raise ValueError(
-                        "MiMoV2ForCausalLM currently supports effective "
-                        "attention TP size 4 only; got "
+                        "MiMoV2ForCausalLM requires effective attention TP "
+                        "size 4 because its fused qkv_proj weights are "
+                        "TP=4-interleaved; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
                         f"enable_dp_attention={self.enable_dp_attention}, "
                         f"attn_cp_size={self.attn_cp_size}). "
                         "Use --tp 4 or --tp 8 --dp 2 --enable-dp-attention "
-                        "for the public MiMo-V2.5 checkpoint."
+                        "so the effective attention TP size is 4."
                     )
 
             if self.speculative_algorithm == "EAGLE":
