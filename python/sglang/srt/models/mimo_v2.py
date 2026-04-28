@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -1307,10 +1308,8 @@ class MiMoV2ForCausalLM(nn.Module):
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    expected_fused_tp_size = (
-                        4
-                        if self.config.architectures[0] == "MiMoV2ForCausalLM"
-                        else None
+                    expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+                        self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
                         name, param, loaded_weight, expected_fused_tp_size

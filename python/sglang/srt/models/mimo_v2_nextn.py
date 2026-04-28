@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -309,7 +310,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         name,
                         param,
                         loaded_weight,
-                        expected_fused_tp_size=4,
+                        expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
+                            self.config
+                        ),
                     )
                 continue
 

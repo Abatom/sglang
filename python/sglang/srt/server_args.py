@@ -1631,7 +1631,10 @@ class ServerArgs:
         )
 
     def _handle_model_specific_adjustments(self):
-        from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.configs.model_config import (
+            get_mimo_v2_fused_qkv_expected_tp_size,
+            is_deepseek_nsa,
+        )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -1954,21 +1957,29 @@ class ServerArgs:
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
             if model_arch == "MiMoV2ForCausalLM":
+                expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+                    hf_config
+                )
                 attn_dp_size = self.dp_size if self.enable_dp_attention else 1
                 effective_attn_tp_size = (
                     self.tp_size // attn_dp_size // self.attn_cp_size
                 )
-                if effective_attn_tp_size != 4:
+                if (
+                    expected_attn_tp_size is not None
+                    and effective_attn_tp_size != expected_attn_tp_size
+                ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
-                        "size 4 because its fused qkv_proj weights are "
-                        "TP=4-interleaved; got "
+                        f"size {expected_attn_tp_size} because its fused "
+                        "qkv_proj weights are "
+                        f"TP={expected_attn_tp_size}-interleaved; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
                         f"enable_dp_attention={self.enable_dp_attention}, "
                         f"attn_cp_size={self.attn_cp_size}). "
-                        "Use --tp 4 or --tp 8 --dp 2 --enable-dp-attention "
-                        "so the effective attention TP size is 4."
+                        "Set --tp, --dp, --enable-dp-attention, and "
+                        "--attention-context-parallel-size so the effective "
+                        f"attention TP size is {expected_attn_tp_size}."
                     )
 
             if self.speculative_algorithm == "EAGLE":

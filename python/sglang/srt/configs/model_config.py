@@ -46,6 +46,12 @@ MIMO_V2_MODEL_ARCHS = (
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
+def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
+    if getattr(hf_config, "attention_projection_layout", None) != "fused_qkv":
+        return None
+    return getattr(hf_config, "num_key_value_heads", None)
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
