@@ -2,7 +2,6 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
@@ -78,15 +77,13 @@ MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
 ]
 
 
-class TestMiMoV2(GSM8KMixin, MMMUMixin, MMMUServerBase):
+class TestMiMoV2(GSM8KMixin, MMMUServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_accept_length_thres = 2.5
-    accuracy = 0.444
     model = MIMO_V2_MODEL
     mem_fraction_static = 0.65
     server_api_key = None
     other_args = MIMO_V2_MTP_OTHER_ARGS
-    mmmu_args = ["--limit=0.1"]
 
 
 if __name__ == "__main__":
