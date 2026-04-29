@@ -62,6 +62,8 @@ MIMO_V2_OTHER_ARGS = [
     "fa3",
     "--mm-attention-backend",
     "fa3",
+    "--reasoning-parser",
+    "mimo",
 ]
 MIMO_V2_MTP_OTHER_ARGS = MIMO_V2_OTHER_ARGS + [
     "--speculative-algorithm",
