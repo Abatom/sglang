@@ -59,7 +59,7 @@ class _FakeNonStreamingErrorOpenAI:
     def _validate_request(self, chat_request):
         return None
 
-    def _convert_to_internal_request(self, chat_request, raw_request):
+    async def _convert_to_internal_request(self, chat_request, raw_request):
         return SimpleNamespace(), chat_request
 
     async def _handle_non_streaming_request(
@@ -89,7 +89,7 @@ class _FakeNonStreamingOpenAI:
     def _validate_request(self, chat_request):
         return None
 
-    def _convert_to_internal_request(self, chat_request, raw_request):
+    async def _convert_to_internal_request(self, chat_request, raw_request):
         return SimpleNamespace(), chat_request
 
     async def _handle_non_streaming_request(

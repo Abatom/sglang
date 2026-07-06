@@ -36,7 +36,7 @@ class ConcreteServingBase(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "test-"
 
-    def _convert_to_internal_request(self, request, raw_request=None):
+    async def _convert_to_internal_request(self, request, raw_request=None):
         pass
 
     def _validate_request(self, request):

@@ -59,6 +59,12 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
 
+    # Sync wrapper for the now-async conversion helper.
+    def _convert_to_internal_request(self, *args, **kwargs):
+        return get_or_create_event_loop().run_until_complete(
+            self.sc._convert_to_internal_request(*args, **kwargs)
+        )
+
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
         req = CompletionRequest(
@@ -67,13 +73,13 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=100,
             session_id="session-1",
         )
-        internal, _ = self.sc._convert_to_internal_request(req)
+        internal, _ = self._convert_to_internal_request(req)
         self.assertEqual(internal.text, "Hello world")
         self.assertEqual(internal.session_id, "session-1")
 
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request(req)
+        internal, _ = self._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
     # ---------- echo-handling ----------
@@ -240,7 +246,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             stream=True,
         )
 
-        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        adapted_request, _ = self._convert_to_internal_request(req)
 
         async def run_stream():
             chunks = []
@@ -351,7 +357,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             return_cached_tokens_details=True,
         )
 
-        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        adapted_request, _ = self._convert_to_internal_request(req)
 
         async def run_stream():
             chunks = []

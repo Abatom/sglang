@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -149,10 +150,16 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             encoding_format="float",
         )
 
+    # Sync wrapper for the now-async conversion helper.
+    def _convert_to_internal_request(self, *args, **kwargs):
+        return get_or_create_event_loop().run_until_complete(
+            self.serving_embedding._convert_to_internal_request(*args, **kwargs)
+        )
+
     def test_convert_single_string_request(self):
         """Test converting single string request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(self.basic_req)
+            self._convert_to_internal_request(self.basic_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
@@ -163,7 +170,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
     def test_convert_list_string_request(self):
         """Test converting list of strings request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(self.list_req)
+            self._convert_to_internal_request(self.list_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
@@ -176,7 +183,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
     def test_convert_token_ids_request(self):
         """Test converting token IDs request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(self.token_ids_req)
+            self._convert_to_internal_request(self.token_ids_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
@@ -187,7 +194,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
     def test_convert_multimodal_request(self):
         """Test converting multimodal request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(self.multimodal_req)
+            self._convert_to_internal_request(self.multimodal_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
@@ -209,7 +216,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             ]
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+        adapted_request, _ = self._convert_to_internal_request(
             self.multimodal_req
         )
 
@@ -248,7 +255,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             return_value="<prompt><image></prompt>"
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+        adapted_request, _ = self._convert_to_internal_request(
             self.image_only_multimodal_req
         )
 
@@ -266,7 +273,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             return_value="<prompt>Describe<video></prompt>"
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+        adapted_request, _ = self._convert_to_internal_request(
             self.video_multimodal_req
         )
 
@@ -283,7 +290,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         """Without any chat template the raw-text fallback must run without raising."""
         self.tokenizer_manager.tokenizer.chat_template = None
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+        adapted_request, _ = self._convert_to_internal_request(
             self.image_only_multimodal_req
         )
 
@@ -295,7 +302,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         """Missing tokenizer should not crash the Jinja branch check."""
         self.tokenizer_manager.tokenizer = None
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+        adapted_request, _ = self._convert_to_internal_request(
             self.multimodal_req
         )
 
@@ -309,7 +316,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "bad template"):
-            self.serving_embedding._convert_to_internal_request(
+            self._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
 
@@ -320,7 +327,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.tokenizer_manager.tokenizer.apply_chat_template = Mock(side_effect=err)
 
         with self.assertRaises(ValueError) as ctx:
-            self.serving_embedding._convert_to_internal_request(
+            self._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
         message = str(ctx.exception)
@@ -335,7 +342,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "missing_field"):
-            self.serving_embedding._convert_to_internal_request(
+            self._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
 

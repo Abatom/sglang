@@ -213,6 +213,15 @@ class OpenAIServingChat(OpenAIServingBase):
             in ("gemma4", "gemma4_unified")
         )
 
+        # Some architectures run the multimodal processor even for requests
+        # without multimodal inputs (see is_mossvl in
+        # TokenizerManager._tokenize_one_request); they need the text prompt,
+        # so the input_ids fast path below must be skipped for them.
+        self._forces_mm_processor = (
+            "MossVLForConditionalGeneration"
+            in (self.tokenizer_manager.model_config.hf_config.architectures or [])
+        )
+
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
@@ -533,7 +542,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
         raw_request: Request = None,
@@ -566,7 +575,7 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = await self._process_messages(request, is_multimodal)
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -577,7 +586,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
+            prompt_kwargs = self._multimodal_prompt_kwargs(processed_messages)
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
@@ -638,7 +647,36 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _process_messages(
+    def _multimodal_prompt_kwargs(
+        self, processed_messages: MessageProcessingResult
+    ) -> Dict[str, Any]:
+        """Prompt kwargs for a request served by a multimodal model.
+
+        Requests carrying multimodal data (and architectures that always run
+        the mm processor) must pass the text prompt, which the mm processor
+        consumes. Text-only requests pass the already-encoded prompt_ids
+        through instead, skipping the second encode in
+        TokenizerManager._tokenize_one_request (the mm processor is not
+        invoked without multimodal inputs). The conversation-template path
+        leaves prompt_ids empty for multimodal models, so it stays on the
+        text path.
+        """
+        has_mm_data = bool(
+            processed_messages.image_data
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        )
+        prompt_ids = processed_messages.prompt_ids
+        if (
+            not has_mm_data
+            and not self._forces_mm_processor
+            and isinstance(prompt_ids, list)
+            and prompt_ids
+        ):
+            return {"input_ids": prompt_ids}
+        return {"text": processed_messages.prompt}
+
+    async def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
@@ -706,14 +744,50 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = await self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
         return result
 
-    def _apply_jinja_template(
+    async def _encode_rendered_prompt(
+        self, rendered_prompt: str, encode_kwargs: Dict[str, Any]
+    ) -> List[int]:
+        """Encode the rendered chat template into token ids.
+
+        When --enable-tokenizer-prefix-cache is set, token ids of recently
+        encoded prompts are reused up to a safe (special-token) boundary and
+        only the remaining suffix is encoded — multi-turn conversations then
+        pay only for the new turn instead of the full history.
+
+        When --enable-dynamic-batch-tokenizer is set, the encode runs off the
+        event loop (with dynamic batching across concurrent requests) so it
+        does not block other requests on this HTTP worker. Otherwise it runs
+        inline, matching the historical behavior.
+        """
+        prefix_cache = self.tokenizer_manager.tokenizer_prefix_cache
+        if prefix_cache is None:
+            return await self._encode_text(rendered_prompt, encode_kwargs)
+
+        prefix_ids, suffix = prefix_cache.match(rendered_prompt)
+        if not suffix:
+            return prefix_ids  # Exact hit on the full prompt.
+        suffix_ids = await self._encode_text(suffix, encode_kwargs)
+        prompt_ids = prefix_ids + suffix_ids
+        prefix_cache.insert(rendered_prompt, prompt_ids)
+        return prompt_ids
+
+    async def _encode_text(
+        self, text: str, encode_kwargs: Dict[str, Any]
+    ) -> List[int]:
+        dynamic_batch_tokenizer = self.tokenizer_manager.async_dynamic_batch_tokenizer
+        if dynamic_batch_tokenizer is not None:
+            result = await dynamic_batch_tokenizer.encode(text, **encode_kwargs)
+            return result["input_ids"]
+        return self.tokenizer_manager.tokenizer.encode(text, **encode_kwargs)
+
+    async def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
@@ -870,8 +944,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
+                prompt_ids = await self._encode_rendered_prompt(
+                    rendered_prompt, encode_kwargs
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -892,8 +966,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
+                    prompt_ids = await self._encode_rendered_prompt(
+                        rendered_prompt, encode_kwargs
                     )
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -907,7 +981,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
 
-            if is_multimodal:
+            if is_multimodal and (
+                image_data or video_data or audio_data or self._forces_mm_processor
+            ):
+                # The multimodal processor consumes the text prompt, so decode
+                # the ids back to text. Text-only requests skip this: they pass
+                # prompt_ids straight through (see _convert_to_internal_request)
+                # and never reach the multimodal processor.
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop

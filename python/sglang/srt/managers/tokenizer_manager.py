@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.tokenizer_prefix_cache import create_tokenizer_prefix_cache
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -272,6 +273,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Init tokenizer prefix cache (only when enabled)
+        self.maybe_init_tokenizer_prefix_cache()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -378,6 +382,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def maybe_init_tokenizer_prefix_cache(self):
+        self.tokenizer_prefix_cache = None
+        if (
+            not self.server_args.enable_tokenizer_prefix_cache
+            or self.tokenizer is None
+        ):
+            return
+        self.tokenizer_prefix_cache = create_tokenizer_prefix_cache(
+            self.tokenizer, self.server_args.tokenizer_prefix_cache_size
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)

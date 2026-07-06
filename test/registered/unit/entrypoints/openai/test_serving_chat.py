@@ -15,7 +15,7 @@ import unittest
 import uuid
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
@@ -59,6 +59,11 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+
+        # TokenizerManager always sets these attributes (None when the
+        # corresponding flags are off).
+        self.async_dynamic_batch_tokenizer = None
+        self.tokenizer_prefix_cache = None
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -118,6 +123,17 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    # Sync wrappers for the now-async conversion helpers.
+    def _convert_to_internal_request(self, *args, **kwargs):
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._convert_to_internal_request(*args, **kwargs)
+        )
+
+    def _process_messages(self, *args, **kwargs):
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(*args, **kwargs)
+        )
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -143,7 +159,7 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
+            adapted, processed = self._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(adapted.session_id, "session-1")
@@ -160,7 +176,7 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "return_prompt_token_ids is not supported with streaming"
         ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+            self._convert_to_internal_request(req, self.fastapi_request)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -173,7 +189,7 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "return_meta_info is not supported with streaming"
         ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+            self._convert_to_internal_request(req, self.fastapi_request)
 
     def test_convert_to_internal_request_input_ids_bypasses_template(self):
         self.tm.tokenizer = None
@@ -188,7 +204,7 @@ class ServingChatTestCase(unittest.TestCase):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
-            adapted, processed = self.chat._convert_to_internal_request(
+            adapted, processed = self._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -236,7 +252,7 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = self._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
 
@@ -279,7 +295,7 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = self._convert_to_internal_request(req)
 
         self.assertTrue(adapted.require_reasoning)
 
@@ -322,7 +338,7 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = self._convert_to_internal_request(req)
 
         self.assertFalse(adapted.require_reasoning)
 
@@ -356,7 +372,7 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="required",
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertNotIn("thinking", kwargs)
@@ -392,7 +408,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": True},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertTrue(kwargs["thinking"])
@@ -428,7 +444,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": False},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertFalse(kwargs["thinking"])
@@ -460,7 +476,7 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         expected_tools = [tool.model_dump() for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
@@ -498,7 +514,7 @@ class ServingChatTestCase(unittest.TestCase):
             [1, 2, 3],
         ]
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         first_tools = self.tm.tokenizer.apply_chat_template.call_args_list[0].kwargs[
             "tools"
@@ -553,7 +569,7 @@ class ServingChatTestCase(unittest.TestCase):
             parser = parser_cls.return_value
             parser.get_structure_constraint.return_value = ("structural_tag", "tag")
 
-            self.chat._process_messages(req, is_multimodal=False)
+            self._process_messages(req, is_multimodal=False)
 
             parser.get_structure_constraint.assert_called_once()
             self.assertFalse(
@@ -595,7 +611,7 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    self._process_messages(req, is_multimodal=False)
 
                 self.tm.tokenizer.apply_chat_template.assert_not_called()
 
@@ -630,7 +646,7 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        self._process_messages(req, is_multimodal=False)
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(
@@ -673,7 +689,7 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    self._process_messages(req, is_multimodal=False)
 
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
@@ -709,7 +725,7 @@ class ServingChatTestCase(unittest.TestCase):
                     ],
                 )
 
-                self.chat._process_messages(req, is_multimodal=False)
+                self._process_messages(req, is_multimodal=False)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -1415,7 +1431,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = self._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -1627,7 +1643,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = self._convert_to_internal_request(
                 req, self.fastapi_request
             )
             chunks = self._run_chat_stream(adapted_request, req)
@@ -1765,7 +1781,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = self._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -1912,7 +1928,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
+            adapted_request, _ = self._convert_to_internal_request(
                 req, self.fastapi_request
             )
 
@@ -2266,6 +2282,162 @@ class ServingChatTestCase(unittest.TestCase):
         r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
         self.assertEqual(r, reasoning)
         self.assertEqual(t, tool_calls)
+
+
+class MultimodalPromptKwargsTestCase(unittest.TestCase):
+    """Text-only requests to a multimodal model pass input_ids through
+    (skipping the decode + re-encode in TokenizerManager), while requests
+    carrying multimodal data keep the text path for the mm processor."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template = Mock(return_value="rendered prompt")
+        self.template_manager = _MockTemplateManager()
+        # Force the Jinja path (no named conversation template).
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.basic_req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+        )
+        self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
+
+    def _mm_result(self, **overrides):
+        kwargs = dict(
+            prompt="",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        kwargs.update(overrides)
+        return MessageProcessingResult(**kwargs)
+
+    # ------------- _multimodal_prompt_kwargs decision logic -------------
+    def test_text_only_request_uses_input_ids(self):
+        kwargs = self.chat._multimodal_prompt_kwargs(self._mm_result())
+        self.assertEqual(kwargs, {"input_ids": [1, 2, 3]})
+
+    def test_request_with_image_uses_text(self):
+        result = self._mm_result(prompt="decoded prompt", image_data=["img"])
+        kwargs = self.chat._multimodal_prompt_kwargs(result)
+        self.assertEqual(kwargs, {"text": "decoded prompt"})
+
+    def test_request_with_audio_uses_text(self):
+        result = self._mm_result(prompt="decoded prompt", audio_data=["aud"])
+        kwargs = self.chat._multimodal_prompt_kwargs(result)
+        self.assertEqual(kwargs, {"text": "decoded prompt"})
+
+    def test_string_prompt_ids_uses_text(self):
+        # The conversation-template path leaves prompt_ids empty / textual for
+        # multimodal models; it must stay on the text path.
+        result = self._mm_result(prompt="prompt text", prompt_ids=[])
+        kwargs = self.chat._multimodal_prompt_kwargs(result)
+        self.assertEqual(kwargs, {"text": "prompt text"})
+
+        result = self._mm_result(prompt="prompt text", prompt_ids="prompt text")
+        kwargs = self.chat._multimodal_prompt_kwargs(result)
+        self.assertEqual(kwargs, {"text": "prompt text"})
+
+    def test_forces_mm_processor_uses_text(self):
+        self.chat._forces_mm_processor = True
+        result = self._mm_result(prompt="decoded prompt")
+        kwargs = self.chat._multimodal_prompt_kwargs(result)
+        self.assertEqual(kwargs, {"text": "decoded prompt"})
+
+    def test_mossvl_architecture_forces_mm_processor(self):
+        self.tm.model_config.hf_config.architectures = [
+            "MossVLForConditionalGeneration"
+        ]
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertTrue(chat._forces_mm_processor)
+
+    # ------------- end-to-end through _convert_to_internal_request -------------
+    def _convert(self, req):
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._convert_to_internal_request(req, self.fastapi_request)
+        )
+
+    def test_convert_text_only_mm_request_passes_input_ids(self):
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = self._mm_result()
+            adapted, _ = self._convert(self.basic_req)
+        self.assertEqual(adapted.input_ids, [1, 2, 3])
+        self.assertIsNone(adapted.text)
+
+    def test_convert_image_mm_request_passes_text(self):
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = self._mm_result(
+                prompt="decoded prompt", image_data=["img"]
+            )
+            adapted, _ = self._convert(self.basic_req)
+        self.assertEqual(adapted.text, "decoded prompt")
+        self.assertIsNone(adapted.input_ids)
+
+    # ------------- decode skip in _apply_jinja_template -------------
+    def _apply_jinja(self):
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._apply_jinja_template(self.basic_req, None, is_multimodal=True)
+        )
+
+    def test_jinja_text_only_skips_decode(self):
+        result = self._apply_jinja()
+        self.assertEqual(result.prompt_ids, [1, 2, 3, 4, 5])
+        self.assertEqual(result.prompt, "")
+        self.tm.tokenizer.decode.assert_not_called()
+
+    def test_jinja_forces_mm_processor_decodes(self):
+        self.chat._forces_mm_processor = True
+        result = self._apply_jinja()
+        self.assertEqual(result.prompt, "Test response")
+        self.tm.tokenizer.decode.assert_called_once_with([1, 2, 3, 4, 5])
+
+    # ------------- _encode_rendered_prompt routing -------------
+    def test_encode_rendered_prompt_inline_by_default(self):
+        ids = get_or_create_event_loop().run_until_complete(
+            self.chat._encode_rendered_prompt("rendered", {"add_special_tokens": False})
+        )
+        self.assertEqual(ids, [1, 2, 3, 4, 5])
+
+    def test_encode_rendered_prompt_uses_dynamic_batch_tokenizer(self):
+        dyn = Mock()
+        dyn.encode = AsyncMock(return_value={"input_ids": [7, 8, 9]})
+        self.tm.async_dynamic_batch_tokenizer = dyn
+        ids = get_or_create_event_loop().run_until_complete(
+            self.chat._encode_rendered_prompt("rendered", {"add_special_tokens": False})
+        )
+        self.assertEqual(ids, [7, 8, 9])
+        dyn.encode.assert_awaited_once_with("rendered", add_special_tokens=False)
+
+    # ------------- tokenizer prefix cache plumbing -------------
+    def test_encode_rendered_prompt_prefix_cache_partial_hit(self):
+        cache = Mock()
+        cache.match.return_value = ([1, 2], "suffix text")
+        self.tm.tokenizer_prefix_cache = cache
+        ids = get_or_create_event_loop().run_until_complete(
+            self.chat._encode_rendered_prompt("full prompt", {})
+        )
+        # Reused prefix ids + mock-encoded suffix ([1, 2, 3, 4, 5]).
+        self.assertEqual(ids, [1, 2, 1, 2, 3, 4, 5])
+        cache.match.assert_called_once_with("full prompt")
+        cache.insert.assert_called_once_with("full prompt", [1, 2, 1, 2, 3, 4, 5])
+
+    def test_encode_rendered_prompt_prefix_cache_exact_hit(self):
+        cache = Mock()
+        cache.match.return_value = ([9, 9, 9], "")
+        self.tm.tokenizer_prefix_cache = cache
+        ids = get_or_create_event_loop().run_until_complete(
+            self.chat._encode_rendered_prompt("full prompt", {})
+        )
+        self.assertEqual(ids, [9, 9, 9])
+        cache.insert.assert_not_called()
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

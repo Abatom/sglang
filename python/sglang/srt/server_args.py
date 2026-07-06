@@ -2533,6 +2533,14 @@ class ServerArgs:
         bool,
         "Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
     ] = False
+    enable_tokenizer_prefix_cache: A[
+        bool,
+        "Cache encoded prefixes of rendered chat prompts; multi-turn requests only re-encode the new suffix. Requires a HuggingFace fast tokenizer.",
+    ] = False
+    tokenizer_prefix_cache_size: A[
+        int,
+        "[Only used if --enable-tokenizer-prefix-cache is set] Max cached prompts per HTTP worker.",
+    ] = 32
     disable_tokenizer_batch_decode: A[
         bool,
         "Disable batch decoding when decoding multiple completions.",
@@ -5653,6 +5661,12 @@ class ServerArgs:
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
                 self.enable_dynamic_batch_tokenizer = False
+
+            if self.enable_tokenizer_prefix_cache:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-tokenizer-prefix-cache; disabling it."
+                )
+                self.enable_tokenizer_prefix_cache = False
 
             logger.info(
                 "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
