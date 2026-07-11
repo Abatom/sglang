@@ -2646,6 +2646,26 @@ class ServerArgs:
         bool,
         "Disable batch decoding when decoding multiple completions.",
     ] = False
+    enable_tokenizer_prefix_cache: A[
+        bool,
+        "Cache chat-template tokenization results keyed by rendered-prompt prefix, so each "
+        "turn of a long multi-turn conversation only encodes the new suffix (spliced at "
+        "special-token boundaries). Applies to /v1/chat/completions and /v1/responses with "
+        "Jinja chat templates. When the dynamic batch tokenizer is also enabled, cached "
+        "prompts bypass it (the cache encodes rendered prompts directly). With "
+        "--tokenizer-worker-num > 1 each tokenizer worker keeps an independent cache.",
+    ] = False
+    tokenizer_prefix_cache_size_mb: A[
+        int,
+        "[Only used if --enable-tokenizer-prefix-cache is set] Max memory for cached "
+        "rendered text + token ids, in MB, per tokenizer worker process. LRU eviction.",
+    ] = 256
+    tokenizer_prefix_cache_verify_first_n: A[
+        int,
+        "[Only used if --enable-tokenizer-prefix-cache is set] Verify the first N cache "
+        "hits against a full re-encode and auto-disable the cache after repeated "
+        "mismatches. -1 verifies every hit (debug); 0 disables verification.",
+    ] = 16
 
     # -------------------------------------------------------------------------
     # Debug tensor dumps
@@ -6005,6 +6025,12 @@ class ServerArgs:
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
                 self.enable_dynamic_batch_tokenizer = False
+
+            if self.enable_tokenizer_prefix_cache:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-tokenizer-prefix-cache; disabling it."
+                )
+                self.enable_tokenizer_prefix_cache = False
 
             logger.info(
                 "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "

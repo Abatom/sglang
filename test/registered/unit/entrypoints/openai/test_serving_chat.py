@@ -60,6 +60,10 @@ class _MockTokenizerManager:
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
 
+        # Prefix cache is always set on the real TokenizerManager (None when
+        # disabled); OpenAIServingChat reads it unconditionally.
+        self.tokenizer_prefix_cache = None
+
         # async generator stub for generate_request
         async def _mock_generate():
             yield {
@@ -335,6 +339,34 @@ class ServingChatTestCase(unittest.TestCase):
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertNotIn("thinking", kwargs)
+
+    def test_jinja_encode_routes_through_prefix_cache(self):
+        """Critical-path bookkeeping: with the tokenizer prefix cache enabled,
+        the jinja encode site must route through it instead of calling
+        tokenizer.encode directly. Guards a future refactor of
+        _apply_jinja_template silently dropping the hook -- no other test
+        would fail."""
+        self.tm.tokenizer_prefix_cache = Mock()
+        self.tm.tokenizer_prefix_cache.encode_with_cache.return_value = [1, 2, 3]
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered prompt"
+        self.tm.tokenizer.encode.reset_mock()
+
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi"}]
+        )
+        result = get_or_create_event_loop().run_until_complete(
+            chat._process_messages(req, is_multimodal=False)
+        )
+
+        self.tm.tokenizer_prefix_cache.encode_with_cache.assert_called_once_with(
+            text="rendered prompt",
+            add_specials_false=chat._tokenizer_auto_adds_specials,
+        )
+        self.tm.tokenizer.encode.assert_not_called()
+        self.assertEqual(result.prompt_ids, [1, 2, 3])
 
     def test_kimi_tool_call_keeps_explicit_template_thinking(self):
         self.template_manager.chat_template_name = None

@@ -56,6 +56,7 @@ class MockTokenizerManager:
         self.tokenizer.encode.return_value = [1, 2, 3]
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        self.tokenizer_prefix_cache = None
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()

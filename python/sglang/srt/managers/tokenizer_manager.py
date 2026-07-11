@@ -113,6 +113,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.tokenizer.prefix_cache import maybe_create_tokenizer_prefix_cache
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -277,6 +278,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Init tokenizer prefix cache (None when disabled)
+        self.maybe_init_tokenizer_prefix_cache()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -383,6 +387,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def maybe_init_tokenizer_prefix_cache(self):
+        self.tokenizer_prefix_cache = maybe_create_tokenizer_prefix_cache(
+            tokenizer=self.tokenizer,
+            enable=self.server_args.enable_tokenizer_prefix_cache,
+            max_size_mb=self.server_args.tokenizer_prefix_cache_size_mb,
+            verify_first_n=self.server_args.tokenizer_prefix_cache_verify_first_n,
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)

@@ -238,6 +238,9 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.model_config.hf_config.architectures or []
         )
 
+        # Prefix cache for chat-template tokenization (None when disabled).
+        self._tokenizer_prefix_cache = tokenizer_manager.tokenizer_prefix_cache
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -743,6 +746,19 @@ class OpenAIServingChat(OpenAIServingBase):
             return result["input_ids"]
         return self.tokenizer_manager.tokenizer.encode(text, **encode_kwargs)
 
+    async def _encode_rendered_prompt(
+        self, *, rendered_prompt: str, encode_kwargs: Dict[str, Any]
+    ) -> List[int]:
+        """Encode a chat-template-rendered prompt, through the prefix cache
+        when enabled (see sglang.srt.tokenizer.prefix_cache). When disabled,
+        fall back to _encode_text (dynamic batch tokenizer when enabled)."""
+        if self._tokenizer_prefix_cache is None:
+            return await self._encode_text(rendered_prompt, encode_kwargs)
+        return self._tokenizer_prefix_cache.encode_with_cache(
+            text=rendered_prompt,
+            add_specials_false=bool(encode_kwargs),
+        )
+
     async def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
@@ -898,7 +914,8 @@ class OpenAIServingChat(OpenAIServingBase):
             # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
             # templates already include role/special tokens, so the encode must
             # avoid double BOS on tokenizers that would add it. Encoding via
-            # _encode_text lets it use the dynamic batch tokenizer when enabled.
+            # _encode_rendered_prompt routes through the prefix cache when
+            # enabled, else the dynamic batch tokenizer when enabled.
             encode_kwargs = (
                 {"add_special_tokens": False}
                 if self._tokenizer_auto_adds_specials
@@ -913,7 +930,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = await self._encode_text(rendered_prompt, encode_kwargs)
+                prompt_ids = await self._encode_rendered_prompt(
+                    rendered_prompt=rendered_prompt, encode_kwargs=encode_kwargs
+                )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -933,7 +952,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
-                    prompt_ids = await self._encode_text(rendered_prompt, encode_kwargs)
+                    prompt_ids = await self._encode_rendered_prompt(
+                        rendered_prompt=rendered_prompt, encode_kwargs=encode_kwargs
+                    )
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
