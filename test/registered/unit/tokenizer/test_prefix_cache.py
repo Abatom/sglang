@@ -10,6 +10,8 @@ full encode).
 import unittest
 
 from sglang.srt.tokenizer.prefix_cache import (
+    PrefixCacheEntry,
+    SpecialBoundary,
     SpecialTokenMatcher,
     TokenizerPrefixCache,
     build_special_matcher,
@@ -278,6 +280,72 @@ class TestPrefixCacheWithStub(CustomTestCase):
             self.assertEqual(longest_common_prefix(a=a, b=b), diff_at)
         self.assertEqual(longest_common_prefix(a=a, b=a), len(a))
         self.assertEqual(longest_common_prefix(a=a, b=a[: chunk + 3]), chunk + 3)
+
+    def test_normalized_special_excluded_from_cut_points(self):
+        """Negative-branch contract: a normalized=True special must NOT become a
+        cut point. It is matched after the normalizer, so it is not the atomic
+        pre-split barrier the splice relies on, and the always-on invariant
+        (first suffix token only) would not catch a normalizer rewrite left of
+        the cut. Red if build_special_matcher drops the normalized filter --
+        the resulting matcher would offer an unsafe cut point."""
+
+        class _AddedToken:
+            def __init__(self, content, normalized):
+                self.content = content
+                self.special = True
+                self.normalized = normalized
+
+            def __str__(self):
+                return self.content
+
+        class _MixedTokenizer:
+            bos_token_id = None
+            added_tokens_decoder = {
+                0: _AddedToken("<S>", normalized=False),
+                1: _AddedToken("<NORM>", normalized=True),
+            }
+            all_special_tokens = ["<S>", "<NORM>"]
+
+            def convert_tokens_to_ids(self, literal):
+                return {"<S>": 0, "<NORM>": 1}[literal]
+
+        matcher = build_special_matcher(tokenizer=_MixedTokenizer())
+        self.assertIsNotNone(matcher)
+        self.assertIn("<S>", matcher.literal_to_id)
+        self.assertNotIn("<NORM>", matcher.literal_to_id)
+        self.assertNotIn(1, matcher.special_id_set)
+        self.assertFalse(matcher.pattern.search("<NORM>"))
+
+    def test_boundary_desync_trips_internal_assert(self):
+        """Internal-invariant guard: entry.ids[cut.token_idx] must equal
+        cut.token_id. The splice-invariant and verify nets only validate the
+        fresh suffix, so a bad cut.token_idx (e.g. an off-by-one in the
+        incremental boundary carry-over) would splice the wrong prefix length
+        silently once verify is past its first-N window. Red if that assert in
+        _encode_via_cut is removed -- this poisoned boundary would then produce
+        corrupt ids instead of failing loudly."""
+        tok = _StubTokenizer()
+        cache = _make_cache(tok)
+        text = "x" * 5000 + SPECIAL + "y" * 100  # SPECIAL at char 5000
+        ids = tok.encode(text)
+        self.assertEqual(ids[5000], SPECIAL_ID)  # token_idx of the special
+        poisoned = SpecialBoundary(
+            char_pos=5000, token_len=len(SPECIAL), token_idx=5000, token_id=999
+        )  # token_id lies: entry.ids[5000] is SPECIAL_ID (0), not 999
+        from array import array
+
+        entry = PrefixCacheEntry(
+            text=text,
+            ids=array("i", ids),
+            boundaries=[poisoned],
+            boundary_char_ends=[5000 + len(SPECIAL)],
+            add_specials_false=False,
+            nbytes=len(text.encode()) + 4 * len(ids),
+        )
+        cache._add_entry(entry)
+        query = text + SPECIAL + "more tokens here"  # shares the full prefix
+        with self.assertRaises(AssertionError):
+            cache.encode_with_cache(text=query, add_specials_false=False)
 
 
 class TestPrefixCacheWithRealTokenizer(CustomTestCase):

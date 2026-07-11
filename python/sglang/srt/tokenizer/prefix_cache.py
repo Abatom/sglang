@@ -111,17 +111,28 @@ def build_special_matcher(*, tokenizer) -> Optional[SpecialTokenMatcher]:
     heterogeneous tokenizer object; errors are contained here.
     """
     literal_to_id: dict[str, int] = {}
+    normalized_specials: set[str] = set()
     try:
         # added_tokens_decoder covers special *added* tokens that are absent
-        # from all_special_tokens (e.g. Llama-3 role markers).
+        # from all_special_tokens (e.g. Llama-3 role markers). Skip any
+        # normalized=True special: it is matched *after* the normalizer runs,
+        # so it is not the pre-normalization atomic pre-split barrier the
+        # splice correctness argument relies on. Using it as a cut point could
+        # break prefix stability in a way the always-on invariant (which only
+        # inspects the first suffix token) would not catch, so exclude it and
+        # let the affected turns fall back to a full encode.
         for token_id, added_token in tokenizer.added_tokens_decoder.items():
-            if added_token.special:
-                literal_to_id[str(added_token)] = token_id
+            if not added_token.special:
+                continue
+            if added_token.normalized:
+                normalized_specials.add(str(added_token))
+                continue
+            literal_to_id[str(added_token)] = token_id
     except AttributeError:
         pass
     try:
         for literal in tokenizer.all_special_tokens:
-            if literal not in literal_to_id:
+            if literal not in literal_to_id and literal not in normalized_specials:
                 literal_to_id[literal] = tokenizer.convert_tokens_to_ids(literal)
     except AttributeError:
         pass
@@ -330,6 +341,17 @@ class TokenizerPrefixCache:
                 self._full_encode(text=text, add_specials_false=add_specials_false),
                 None,
             )
+
+        # Internal invariant (not a tokenizer-behavior check): the boundary
+        # table must index entry.ids consistently. The splice-invariant and
+        # verify nets below only validate the freshly encoded *suffix*; neither
+        # catches a bad cut.token_idx (e.g. an off-by-one in the incremental
+        # boundary carry-over), which would silently splice the wrong prefix
+        # length once verify is past its first-N window. Guard it here.
+        assert entry.ids[cut.token_idx] == cut.token_id, (
+            "prefix-cache boundary desync: entry.ids[%d]=%d != cut.token_id=%d"
+            % (cut.token_idx, entry.ids[cut.token_idx], cut.token_id)
+        )
 
         suffix_ids = self._full_encode(
             text=text[cut.char_pos :], add_specials_false=add_specials_false
